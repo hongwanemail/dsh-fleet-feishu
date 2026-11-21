@@ -1,6 +1,6 @@
 {
   "name": "dsh-fleet-feishu",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "type": "module",
   "description": "DSH 插件：把 DeepSeek Harness 变成飞书群里的员工——多设备 agent 协作调度、路条协议、回执注回、群名册",
   "keywords": [

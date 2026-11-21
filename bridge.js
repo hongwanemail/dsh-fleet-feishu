@@ -326,18 +326,94 @@ export function createBridge(config, log, hooks = {}) {
   }
   const fixedSession = () => String(config.session_id || "").trim();
 
+  // ===== 零配置自举（2026-11-21）：自己找出"我在哪个群、我是谁" =====
+  // 起因：GUI 装完插件不知道要填 chat_id → 群里 @ 它的 bot 零回应 → 普通人以为插件坏了。
+  const bootstrapState = { tried: false, done: false, note: "" };
+
+  /** 列出当前账号加入的所有群（user 身份） */
+  async function listChats() {
+    const r = await larkRun(["im", "+chat-list", "--types", "group", "--as", "user"], 45000);
+    if (!r.ok) return [];
+    try {
+      const j = extractJson(r.stdout);          // lark-cli 输出前有进度行，不能直接 parse
+      const chats = j?.data?.chats || [];
+      return chats.map((c) => ({ id: c.chat_id || "", name: c.name || "" }));
+    } catch { return []; }
+  }
+
+  /** 查某群的成员（bot 名单含 app_id 与 member_id） */
+  async function chatBots(chatId) {
+    const r = await larkRun(["im", "+chat-members-list", "--chat-id", chatId, "--page-all", "--as", "user"], 45000);
+    if (!r.ok) return [];
+    try {
+      const j = extractJson(r.stdout);          // 同上
+      const bots = j?.data?.bots || [];
+      return bots.map((b) => ({ name: b.name || "", appId: b.app_id || "", openId: b.member_id || "" }));
+    } catch { return []; }
+  }
+
+  /**
+   * 自举：找出"我"在哪个群。
+   * 判定"我是谁" = 我的 app_id（auth status）→ 在群成员里按 app_id 匹配。
+   * 兜底：群里有且只有一个 bot 时也认（用户只建了一个应用的情况）。
+   */
+  async function bootstrap() {
+    if (bootstrapState.done || bootstrapState.tried) return bootstrapState;
+    bootstrapState.tried = true;
+    try {
+      const myAppId = await detectSelfAppId();
+      if (!myAppId) {
+        bootstrapState.note = "拿不到自己的 app_id（auth status 失败）";
+        return bootstrapState;
+      }
+      const chats = await listChats();
+      if (!chats.length) {
+        bootstrapState.note = "该账号没有加入任何群";
+        return bootstrapState;
+      }
+      // 优先：名字含"调度"或配置里指定的群；否则取第一个含我的群
+      const candidates = chats.length > 30 ? chats.slice(0, 30) : chats;
+      for (const c of candidates) {
+        const bots = await chatBots(c.id);
+        if (!bots.length) continue;
+        const mine = bots.find((b) => b.appId === myAppId);
+        if (!mine) continue;
+        // 找到了"我"在这个群
+        if (!config.chat_id) config.chat_id = c.id;
+        if (!config.bot_open_id) config.bot_open_id = mine.openId;
+        if (!config.device_name || config.device_name === "agent") config.device_name = mine.name;
+        bootstrapState.done = true;
+        bootstrapState.note = "已自举：群=" + (c.name || c.id) + " 设备名=" + config.device_name;
+        log("✅ 零配置自举成功：" + bootstrapState.note + "（chat_id=" + c.id + "）");
+        return bootstrapState;
+      }
+      bootstrapState.note = "在 " + candidates.length + " 个群里都没找到自己（我的 app_id=" + myAppId + "）——请确认已把本 bot 拉进群";
+      log("⚠ 自举未果：" + bootstrapState.note);
+    } catch (e) {
+      bootstrapState.note = "自举异常：" + String(e).slice(0, 120);
+      log("⚠ " + bootstrapState.note);
+    }
+    return bootstrapState;
+  }
+
   // ===== bot_open_id 自动探测 =====
   // 名册里 bot 的 member_id = 本应用视角的 ou_ open_id ← 这就是 bot_open_id；
   // 用自己的 app_id（lark-cli auth status）在名册里匹配即可，用户无需手填。
   const autodetectState = { appId: "", botOpenId: "", done: false };
   async function detectSelfAppId() {
+    // 注意：`auth status` 不是标准 lark-cli 响应（【没有 ok 字段】）→ 不能用 r.ok 判定
     const r = await larkRun(["auth", "status"], 30000);
-    if (!r.ok) return "";
     try {
-      const j = JSON.parse(r.stdout);
-      const appId = j?.data?.appId || j?.appId || j?.data?.app_id || j?.app_id || "";
+      const j = extractJson(r.stdout);
+      const appId = j?.appId || j?.app_id
+        || j?.data?.appId || j?.data?.app_id
+        || j?.data?.identity?.appId || j?.data?.bot?.appId || "";
+      if (!appId) log("auth status 无 app_id：" + String(r.detail || r.stdout || "").slice(0, 200));
       return String(appId || "");
-    } catch { return ""; }
+    } catch (e) {
+      log("auth status 解析失败：" + String(e).slice(0, 120) + " raw=" + String(r.stdout || "").slice(0, 200));
+      return "";
+    }
   }
   /** 从名册里按 app_id 匹配出本 bot 的 member_id（= bot_open_id） */
   function matchSelfFromRoster(members, appId) {
@@ -775,6 +851,7 @@ export function createBridge(config, log, hooks = {}) {
       "名册: " + (st.roster ? (st.roster.members || []).length + " 员（" + new Date(st.roster.updated_at).toLocaleString("sv-SE") + "，" + st.roster.identity + " 身份）" : "未拉取"),
       "最近事件: " + (s.lastEventAt ? new Date(s.lastEventAt).toLocaleString() : "无"),
       "最近任务: " + (s.lastTaskAt ? new Date(s.lastTaskAt).toLocaleString() : "无"),
+      "自举: " + (bootstrapState.done ? "✅ " + bootstrapState.note : (bootstrapState.note || "未触发")),
       "bot_open_id: " + (config.bot_open_id
         ? (autodetectState.botOpenId ? (autodetectState.botOpenId + "（自动探测）") : "（配置填写）")
         : "⚠ 未探测到"),
@@ -807,14 +884,25 @@ export function createBridge(config, log, hooks = {}) {
     statusText,
     getRoster: () => st.roster,
     refreshRoster,
+    bootstrap,
     askOnline,
     collectMemos,
     isPeerOnline,
     markPeerOnline,
     pendingHello,
     start() {
+      // 零配置自举：先自己找出"我在哪个群、我是谁"，再决定要不要手填
+      st.queue = st.queue.then(async () => {
+        if (!config.chat_id || !config.bot_open_id || !config.device_name || config.device_name === "agent") {
+          await bootstrap();
+        }
+      });
       const needCfg = config.chat_id && config.device_name;
-      if (!needCfg) { log("配置不完整（device_name / chat_id），桥未启动。请在插件配置里填写。"); return; }
+      if (!needCfg) {
+        log("配置不完整且自举失败 —— 桥保持休眠。请在插件配置里填 device_name 与 chat_id。");
+        log("  提示：把本 bot 拉进群后重启客户端，插件会自己找到群（自举：" + bootstrapState.note + "）");
+        return;
+      }
       if (!config.bot_open_id) {
         log("未配置 bot_open_id —— 尝试自动探测（拉名册后按自己的 app_id 匹配）");
       }

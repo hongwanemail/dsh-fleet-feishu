@@ -36,28 +36,71 @@ function textTool(name, description, parameters, execute, isConcurrencySafe) {
 // Config schema（Schemastery / Standard Schema）——Cordis 加载时校验并填默认值。
 // 关键三项（device_name / chat_id / bot_open_id）缺失时不阻断插件加载，只让桥保持休眠，
 // 原因见 checkConfig 的注释（这是本插件的既定行为：工具始终可见，便于排查）。
+// 注意：所有字段都用 .volatile() 声明——DSH 设置页「插件 → 插件配置」的表单
+// 只展示 volatile 字段（@deepseek-ai/dsh-settings），不加 volatile 就看不到 → 用户不会整。
+// 改动由 @deepseek-ai/dsh-config-editor 写回 profile patch 并立即生效。
 export const Config = Schema.object({
-  device_name: Schema.string().default("agent"),
-  chat_id: Schema.string().default(""),
-  bot_open_id: Schema.string().default(""),   // 留空 = 自动探测（按自己的 app_id 在名册里匹配）
-  task_timeout_sec: Schema.number().default(300),
-  max_reply_chars: Schema.number().default(3500),
-  task_max_depth: Schema.number().default(3),
-  receipt_window_min: Schema.number().default(45),
-  roster_interval_min: Schema.number().default(60),
-  send_identity: Schema.string().default("bot"),
-  reply_identity: Schema.string().default("bot"),
-  reply_reject: Schema.boolean().default(true),
-  session_id: Schema.string().default(""),
-  headless_profile: Schema.string().default(""),
-  headless_env_file: Schema.string().default(""),
-  headless_workspace: Schema.string().default(""),
-  lark_entry: Schema.string().default(""),
-  dsh_entry: Schema.string().default(""),
+  device_name: Schema.string().default("agent")
+    .description("★ 必填：你在群里的署名，例如「小鲸鱼-办公室PC」。群里发消息时会带上它，别人才知道是谁在干活。")
+    .volatile(),
+  chat_id: Schema.string().default("")
+    .description("★ 必填：飞书群 ID（oc_ 开头）。打开群 → 群设置 → 群 ID 即可复制。机器人只在这个群里派活。")
+    .volatile(),
+  bot_open_id: Schema.string().default("")
+    .description("机器人 open_id（ou_ 开头）——【可留空】：留空时插件会拉群名册、按自己的飞书应用自动匹配；若自动匹配不到（群里没这个机器人或应用不一致），可从群成员列表里找该机器人的 open_id 填这里。")
+    .volatile(),
+  task_timeout_sec: Schema.number().default(300)
+    .description("单个任务的执行超时（秒）。")
+    .volatile(),
+  max_reply_chars: Schema.number().default(3500)
+    .description("单条回帖的最大字符数，超出截断。")
+    .volatile(),
+  task_max_depth: Schema.number().default(3)
+    .description("路条派活的最大转手深度（安全闸），超过就拒收。")
+    .volatile(),
+  receipt_window_min: Schema.number().default(45)
+    .description("回执注回的等待窗口（分钟）。")
+    .volatile(),
+  roster_interval_min: Schema.number().default(60)
+    .description("群名册刷新间隔（分钟）；-1 关闭。")
+    .volatile(),
+  send_identity: Schema.string().default("bot")
+    .description("发消息用的身份：bot（机器人，推荐）或 user（真人身份，一般不用）。")
+    .volatile(),
+  reply_identity: Schema.string().default("bot")
+    .description("回执用的身份：bot（推荐）或 user。")
+    .volatile(),
+  reply_reject: Schema.boolean().default(true)
+    .description("收到不合规的 agent 消息时是否回一条拒绝提示。")
+    .volatile(),
+  session_id: Schema.string().default("")
+    .description("固定 dsh 会话 id；留空 = 每个任务自动开会话。")
+    .volatile(),
+  headless_profile: Schema.string().default("")
+    .description("执行任务用的 DSH profile 名；留空 = 默认 headless。")
+    .volatile(),
+  headless_env_file: Schema.string().default("")
+    .description("存放模型 key 的 .env 文件路径（留空自动找）。")
+    .volatile(),
+  headless_workspace: Schema.string().default("")
+    .description("执行任务的工作目录（会话按它分桶，改了会导致旧会话找不到）。")
+    .volatile(),
+  lark_entry: Schema.string().default("")
+    .description("lark-cli 可执行文件路径；留空 = 自动探测。")
+    .volatile(),
+  dsh_entry: Schema.string().default("")
+    .description("dsh 可执行文件路径；留空 = 自动探测。")
+    .volatile(),
   // 「像人一样协作」：问-答 + 留言板
-  hello_timeout_sec: Schema.number().default(12),
-  peer_ttl_sec: Schema.number().default(300),
-  ask_before_dispatch: Schema.boolean().default(true),
+  hello_timeout_sec: Schema.number().default(12)
+    .description("问对方「在吗」后等多久算没回应（秒），超时转为留言。")
+    .volatile(),
+  peer_ttl_sec: Schema.number().default(300)
+    .description("多久没应答就认为对方已离线（秒）。")
+    .volatile(),
+  ask_before_dispatch: Schema.boolean().default(true)
+    .description("派活前先问一句「在吗」：答了就派，没答就留言。关掉则直接派。")
+    .volatile(),
 });
 
 function checkConfig(config) {

@@ -1,0 +1,4 @@
+# 开源规范：文本统一 LF 入库（node 全平台通吃 LF，消除 Windows clone 的 CRLF 警告与 diff 噪音）
+* text=auto eol=lf
+*.png binary
+*.svg text

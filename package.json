@@ -1,0 +1,65 @@
+{
+  "name": "dsh-fleet-feishu",
+  "version": "1.4.0",
+  "type": "module",
+  "description": "DSH 插件：把 DeepSeek Harness 变成飞书群里的员工——多设备 agent 协作调度、路条协议、回执注回、群名册",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "feishu",
+    "lark",
+    "fleet",
+    "multi-agent",
+    "orchestration",
+    "chatbot"
+  ],
+  "author": {
+    "name": "杨宏万 (honghongwan)"
+  },
+  "engines": {
+    "node": ">=22.19",
+    "dsh": ">=0.2.0 <0.3.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "bridge.js",
+    "cordis.patch.yml",
+    "docs",
+    "icon.svg",
+    "index.js",
+    "locale/*.json",
+    "test"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "main": "index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hongwanemail/dsh-fleet-feishu.git",
+    "directory": "packages/dsh-fleet-feishu"
+  },
+  "bugs": {
+    "url": "https://github.com/hongwanemail/dsh-fleet-feishu/issues"
+  },
+  "homepage": "https://github.com/hongwanemail/dsh-fleet-feishu#readme",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "~3.19.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "~3.19.0"
+  }
+}

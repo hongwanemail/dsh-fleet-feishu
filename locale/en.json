@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Fleet dispatch - Feishu group",
+    "description": "Connects this device's DSH agent to a Feishu group: @-mention tasks are executed via dsh headless with auto-receipts; task-pass gate for agent-to-agent dispatch; in-group commands /new /status /roster /resume; final remote results are injected back into the originating session; exposes fleet_status / fleet_send / fleet_roster tools. Requires lark-cli installed and bot/user authorization first.",
+    "detail": "docs/DETAIL.md"
+  }
+}

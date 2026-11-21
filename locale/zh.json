@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Agent 调度-飞书群",
+    "description": "把本机 DSH agent 接入飞书群：群里 @本bot 派任务，本机用 dsh headless 执行并自动回执；路条硬闸 + 群内指令 /new /status /roster /resume；对端终态结果自动注回发起会话（派完不用盯群）；提供 fleet_status / fleet_send / fleet_roster 工具。需先安装 lark-cli 并完成 bot/user 授权。",
+    "detail": "docs/DETAIL.md"
+  }
+}

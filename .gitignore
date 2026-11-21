@@ -1,0 +1,13 @@
+# 依赖与构建产物
+node_modules/
+*.tgz
+.pnpm-store/
+
+# 编辑器
+.DS_Store
+.vscode/
+.idea/
+
+# 日志与临时文件
+*.log
+.npmrc.local

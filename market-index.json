@@ -1,0 +1,64 @@
+{
+  "format": 1,
+  "title": {
+    "en": "Hongwan Plugin Market",
+    "zh-cn": "杨宏万的插件市场"
+  },
+  "description": {
+    "en": "Self-hosted DeepSeek Harness plugin market index.",
+    "zh-cn": "DeepSeek Harness 插件市场索引（自建）。"
+  },
+  "metadata": {
+    "title": {
+      "en": "Hongwan Plugin Market",
+      "zh-cn": "杨宏万的插件市场"
+    },
+    "description": {
+      "en": "Self-hosted DeepSeek Harness plugin market index.",
+      "zh-cn": "DeepSeek Harness 插件市场索引（自建）。"
+    }
+  },
+  "plugins": [
+    {
+      "name": "dsh-fleet-feishu",
+      "title": {
+        "en": "Fleet Feishu - multi-device agent orchestration",
+        "zh-cn": "飞书飞派 · 多设备 agent 调度"
+      },
+      "description": {
+        "en": "Turn DSH into a teammate in your Feishu group: @ to dispatch, task-pass between agents, receipts injected back into your session, ask/reply presence and memo board, group roster.",
+        "zh-cn": "把 DeepSeek Harness 变成飞书群里的队友：群里 @ 就派活、机器人之间带路条互相派活、结果自动注回会话、问-答确认在线与留言板、群名册与 @ 模糊匹配。"
+      },
+      "icon": "icon.svg",
+      "author": "杨宏万 (yanghongwan)",
+      "homepage": "https://github.com/hongwanemail/dsh-fleet-feishu#readme",
+      "repository": {
+        "url": "https://github.com/hongwanemail/dsh-fleet-feishu"
+      },
+      "metadata": {
+        "title": {
+          "en": "Fleet Feishu",
+          "zh-cn": "飞书飞派"
+        },
+        "description": {
+          "en": "Feishu group orchestration for DeepSeek Harness.",
+          "zh-cn": "DeepSeek Harness 的飞书群组协调度插件。"
+        }
+      },
+      "versions": [
+        {
+          "version": "1.5.0",
+          "publishTimestamp": 1795236003,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/hongwanemail/dsh-fleet-feishu",
+            "commit": "32e394cf1f067db5f7e5e2dfd1e2e2e6d191cee8"
+          },
+          "engines": {
+            "dsh": ">=0.2.0 <0.3.0"
+          }
+        }
+      ]
+    }
+  ]
+}

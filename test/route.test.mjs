@@ -2,7 +2,7 @@
 // 覆盖：路条硬闸（bot 无路条拒收/深度超限/同任务回环）、reply 继承闸、回执前缀闸、
 //       群内指令识别（仅 user 且无路条）、mention/群/消息类型过滤。
 import assert from "node:assert/strict";
-import { routeEvent, parseTaskPass, findReceipt, isBotReply, isFinalReceipt, shouldTrackReceipt } from "../bridge.js";
+import { routeEvent, parseTaskPass, findReceipt, isBotReply, isFinalReceipt, shouldTrackReceipt, parseHello, parsePong, parseMemo, classifyControl, makeToken } from "../bridge.js";
 
 const CFG = { chat_id: "oc_test", bot_open_id: "ou_bot_self", max_depth: 3 };
 const M = (id) => [{ id, key: "@_user_1", name: "小鲸鱼-测试" }];
@@ -176,5 +176,21 @@ t("bot /resume（无路条）-> 仍拒（指令仅老板）", () => {
   const r = routeEvent(evt({ sender_type: "bot", sender_id: "ou_other", content: "/resume" }), CFG);
   assert.equal(r.accept, false);
 });
+
+
+// ===== 「像人一样协作」问-答 + 留言板（2026-11-21）=====
+t("parseHello 取 token", () => assert.equal(parseHello("[HELLO|tok-1] 在吗？")?.token, "tok-1"));
+t("parseHello 无匹配返回 null", () => assert.equal(parseHello("在吗？"), null));
+t("parsePong 取 token", () => assert.equal(parsePong("[PONG|tok-1] 在")?.token, "tok-1"));
+t("parsePong 无匹配返回 null", () => assert.equal(parsePong("在"), null));
+t("parseMemo 取 taskId", () => assert.equal(parseMemo("[MEMO|T1|小李] 帮我看一下")?.taskId, "T1"));
+t("parseMemo 取 from", () => assert.equal(parseMemo("[MEMO|T1|小李] 帮我看一下")?.from, "小李"));
+t("classifyControl 识别 HELLO", () => assert.equal(classifyControl("[HELLO|x] 在吗？"), "hello"));
+t("classifyControl 识别 PONG", () => assert.equal(classifyControl("[PONG|x] 在"), "pong"));
+t("classifyControl 识别 MEMO", () => assert.equal(classifyControl("[MEMO|T|小李] 消息"), "memo"));
+t("classifyControl 普通消息不匹配", () => assert.equal(classifyControl("普通任务"), null));
+t("makeToken 生成可配对 token", () => assert.match(makeToken("H"), /^H-[a-z0-9]+-[a-z0-9]+$/));
+t("makeToken 不重复", () => assert.notEqual(makeToken("H"), makeToken("H")));
+t("问询消息走专用通道（不当任务执行）", () => assert.equal(classifyControl("[HELLO|tok-9] 在吗？"), "hello"));
 
 console.log(`\n${n} 项断言完成，exitCode=${process.exitCode || 0}`);

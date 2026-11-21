@@ -10,7 +10,7 @@
 // 生命周期：apply 时按配置启动桥接；配置变更触发插件重启（apply 重跑），cleanup 自动停旧桥。
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
-import { createBridge, makeLogger, runtimeDir } from "./bridge.js";
+import { createBridge, makeLogger, runtimeDir, parseTaskPass } from "./bridge.js";
 
 export const name = "fleet-feishu";
 export const inject = ["tools", "timer", "agents"];
@@ -39,7 +39,7 @@ function textTool(name, description, parameters, execute, isConcurrencySafe) {
 export const Config = Schema.object({
   device_name: Schema.string().default("agent"),
   chat_id: Schema.string().default(""),
-  bot_open_id: Schema.string().default(""),
+  bot_open_id: Schema.string().default(""),   // 留空 = 自动探测（按自己的 app_id 在名册里匹配）
   task_timeout_sec: Schema.number().default(300),
   max_reply_chars: Schema.number().default(3500),
   task_max_depth: Schema.number().default(3),
@@ -54,20 +54,18 @@ export const Config = Schema.object({
   headless_workspace: Schema.string().default(""),
   lark_entry: Schema.string().default(""),
   dsh_entry: Schema.string().default(""),
-  // Presence（MQTT 风格在线感知，载体=多维表格心跳表）：
-  // 填 base_token + table_id 即启用；留空 = 完全不启用（零开销）
-  presence_base_token: Schema.string().default(""),
-  presence_table_id: Schema.string().default(""),
-  presence_interval_sec: Schema.number().default(60),
-  presence_ttl_sec: Schema.number().default(90),
-  presence_version: Schema.string().default(""),
+  // 「像人一样协作」：问-答 + 留言板
+  hello_timeout_sec: Schema.number().default(12),
+  peer_ttl_sec: Schema.number().default(300),
+  ask_before_dispatch: Schema.boolean().default(true),
 });
 
 function checkConfig(config) {
   const problems = [];
   if (!config.device_name || config.device_name === "未命名设备") problems.push("device_name 未设置（群里署名用）");
   if (!/^oc_[\w-]+$/.test(config.chat_id || "")) problems.push("chat_id 未设置或不是 oc_ 开头的群 ID");
-  if (!/^ou_[\w-]+$/.test(config.bot_open_id || "")) problems.push("bot_open_id 未设置或不是 ou_ 开头");
+  // bot_open_id 留空可运行：桥会拉名册后按自己的 app_id 自动匹配（实测可靠）
+  if (config.bot_open_id && !/^ou_[\w-]+$/.test(config.bot_open_id)) problems.push("bot_open_id 格式不对（ou_ 开头）；留空则自动探测");
   if (typeof config.task_timeout_sec !== "number" || config.task_timeout_sec <= 0) problems.push("task_timeout_sec 必须为正数");
   return problems;
 }
@@ -135,29 +133,30 @@ export function apply(ctx, config) {
   ));
 
   ctx.tools.register(textTool(
-    "fleet_presence",
-    "查看舰队各设备的在线状态（Presence 心跳表）：每台设备的 last_seen、状态（在线/离线由 TTL 判定）、当前任务、插件版本。用于派活前确认对方是否在线，避免“消息发出去没人接”。未配置心跳表时返回未启用。",
-    {},
-    async () => {
-      const pres = bridge.presence;
-      if (!pres || !pres.enabled()) {
-        return "Presence 未启用：在插件配置里填 presence_base_token 与 presence_table_id（多维表格的 base_token 与 table_id）后生效。";
+    "fleet_online",
+    "查看舰队里各设备最近一次被证实在线的时间（问-答机制：对方回答「在」才算在线）。也可用 action=ping 主动问一圈谁在线。",
+    {
+      action: { type: "string", description: "show=看已知在线状态（默认），ping=主动问一圈" },
+    },
+    async (args) => {
+      const act = (args?.action || "show");
+      if (act === "ping") {
+        const rows = bridge.getRoster()?.members || [];
+        const bots = rows.filter((m) => m.type === "bot" && m.open_id !== config.bot_open_id);
+        const out = [];
+        for (const b of bots) {
+          const ok = await bridge.askOnline(b.open_id, "ping");
+          out.push("- " + (b.name || b.open_id) + "  " + (ok ? "🟢 在" : "🔴 没应答"));
+        }
+        return out.length ? "问了一圈：\n" + out.join("\n") : "群里没有别的 bot。";
       }
-      const rows = await pres.list();
-      if (!rows.length) return "心跳表里还没有记录（各设备上线后会自动写入）。";
-      const now = Date.now();
-      const lines = rows.map((r) => {
-        const online = pres.judgeOnline(r, now);
-        const last = r.lastSeen ? r.lastSeen.replace("T", " ").slice(0, 19) : "(未知)";
-        return "- " + (r.device || r.alias || "(未命名)")
-          + "  " + (online ? "🟢 在线" : "🔴 离线")
-          + "  last_seen=" + last
-          + "  状态=" + (r.status || "?")
-          + (r.task ? "  最后任务=" + r.task : "")
-          + (r.version ? "  版本=" + r.version : "")
-          + (r.appId ? "  app=" + r.appId.slice(0, 10) + "…" : "");
+      const rows = bridge.getRoster()?.members || [];
+      const lines = rows.filter((m) => m.type === "bot").map((m) => {
+        const on = bridge.isPeerOnline(m.open_id);
+        return "- " + m.name + "  " + (on ? "🟢 在线" : "⚪ 未知（没问过或没应答）");
       });
-      return "舰队在线状态（TTL " + Math.round(pres.ttlMs() / 1000) + "s，超时判离线）：\n" + lines.join("\n");
+      return "设备在线状态（问-答机制）：\n" + (lines.join("\n") || "（名册为空）")
+        + "\n提示：派活时会自动先问「在吗」，没应答就留言。";
     },
     () => true
   ));

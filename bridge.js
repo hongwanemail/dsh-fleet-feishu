@@ -22,6 +22,39 @@ export { };
 
 const TASK_PASS_RE = /任务ID\s*[|｜]\s*([\w.\-]+)\s*[|｜]\s*([^|｜]+?)\s*[|｜]\s*派发深度\s*(\d+)/;
 
+// ===== 「像人一样协作」协议（2026-11-21 宏万拍板，取代多维表格 presence 方案）=====
+// 问-答 + 留言板：零基建、零配置、不需要任何共享存储。
+export const HELLO_RE = /\[HELLO\|([A-Za-z0-9_.\-]+)\]/;
+export const PONG_RE = /\[PONG\|([A-Za-z0-9_.\-]+)\]/;
+export const MEMO_RE = /\[MEMO\|([^|\]]+)\|([^\]]+)\]/;
+
+export function parseHello(text) {
+  const m = String(text || "").match(HELLO_RE);
+  return m ? { token: m[1] } : null;
+}
+export function parsePong(text) {
+  const m = String(text || "").match(PONG_RE);
+  return m ? { token: m[1] } : null;
+}
+export function parseMemo(text) {
+  const m = String(text || "").match(MEMO_RE);
+  return m ? { taskId: m[1], from: m[2] } : null;
+}
+
+/** 消息类型判定：HELLO / PONG / MEMO 都不是"任务"，走各自专用通道 */
+export function classifyControl(text) {
+  const t = String(text || "");
+  if (HELLO_RE.test(t)) return "hello";
+  if (PONG_RE.test(t)) return "pong";
+  if (MEMO_RE.test(t)) return "memo";
+  return null;
+}
+
+/** 生成短 token（问-答配对用） */
+export function makeToken(prefix) {
+  return prefix + "-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
 // 解析路条 [任务ID|X|Y|派发深度N]（全半角竖线均可，兼容正文任意位置）
 export function parseTaskPass(text) {
   const m = String(text || "").match(TASK_PASS_RE);
@@ -117,7 +150,6 @@ export function findReceipt(evt, receipts, now = Date.now()) {
 }
 
 import { spawn } from "node:child_process";
-import { createPresence } from "./presence.js";
 import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync, statSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
@@ -260,7 +292,7 @@ export function createBridge(config, log, hooks = {}) {
 
   const st = {
     running: false, child: null, restartTimer: null, restartIdx: 0,
-    lastEventAt: null, lastTaskAt: null, lastTaskId: "", queue: Promise.resolve(), stopped: false,
+    lastEventAt: null, lastTaskAt: null, queue: Promise.resolve(), stopped: false,
     roster: readJsonSafe(rosterFile) || null,
     receipts: (readJsonSafe(receiptsFile)?.receipts || []).filter((r) => r.expires > Date.now()),
     resume: readJsonSafe(resumeFile) || null,
@@ -294,57 +326,91 @@ export function createBridge(config, log, hooks = {}) {
   }
   const fixedSession = () => String(config.session_id || "").trim();
 
-  // ---- Presence（MQTT 风格在线感知，载体=多维表格心跳表）----
-  const presence = createPresence({ config, log, larkRun, workDir: dir });
-  const presenceState = { recordId: "", appId: "", alias: "" };
-  function loadPresenceCache() {
-    const f = join(dir, "presence.json");
-    const saved = readJsonSafe(f);
-    if (saved?.record_id) presenceState.recordId = saved.record_id;
-    if (saved?.app_id) presenceState.appId = saved.app_id;
-  }
-  function savePresenceCache() {
-    try { writeFileSync(join(dir, "presence.json"), JSON.stringify({
-      record_id: presenceState.recordId, app_id: presenceState.appId,
-    }), "utf8"); } catch {}
-  }
-  loadPresenceCache();
-
-  // 从名册里找"自己"：用 app_id（全局唯一、视角无关）匹配
-  function resolveSelfAlias() {
-    const myApp = presenceState.appId || "";
-    const members = st.roster?.members || [];
-    if (myApp) {
-      const hit = members.find((m) => m.app_id === myApp);
-      if (hit) return { alias: hit.name || "", openId: hit.open_id || "" };
-    }
-    // 退化：按 bot_open_id 匹配
-    const hit2 = members.find((m) => m.open_id === config.bot_open_id);
-    return hit2 ? { alias: hit2.name || "", openId: hit2.open_id || "" } : { alias: "", openId: "" };
-  }
-
-  async function heartbeat(status) {
-    if (!presence.enabled()) return;
+  // ===== bot_open_id 自动探测 =====
+  // 名册里 bot 的 member_id = 本应用视角的 ou_ open_id ← 这就是 bot_open_id；
+  // 用自己的 app_id（lark-cli auth status）在名册里匹配即可，用户无需手填。
+  const autodetectState = { appId: "", botOpenId: "", done: false };
+  async function detectSelfAppId() {
+    const r = await larkRun(["auth", "status"], 30000);
+    if (!r.ok) return "";
     try {
-      if (!presenceState.recordId && !presenceState.appId) {
-        // 首次：找已有行（可能上次创建过但没缓存 id）
-        const self = await presence.findSelfRow(presenceState.appId, config.device_name);
-        if (self) presenceState.recordId = self.recordId || "";
-      }
-      const r = await presence.write({
-        status,
-        taskId: st.lastTaskId || "",
-        appId: presenceState.appId,
-        alias: presenceState.alias,
-        recordId: presenceState.recordId,
-      });
-      if (r.ok) {
-        if (r.recordId) presenceState.recordId = r.recordId;
-        savePresenceCache();
+      const j = JSON.parse(r.stdout);
+      const appId = j?.data?.appId || j?.appId || j?.data?.app_id || j?.app_id || "";
+      return String(appId || "");
+    } catch { return ""; }
+  }
+  /** 从名册里按 app_id 匹配出本 bot 的 member_id（= bot_open_id） */
+  function matchSelfFromRoster(members, appId) {
+    if (!appId) return "";
+    const hit = (members || []).find((m) => m.type === "bot" && m.app_id === appId);
+    return hit ? String(hit.open_id || "") : "";
+  }
+
+  // ===== 问-答在线状态 =====
+  // pendingHello: token -> { target, resolve, timer }   等待对方答"在"
+  // peerOnline : open_id -> { at, name }               最近一次被证实在线的时间
+  const pendingHello = new Map();
+  const peerOnline = new Map();
+  const HELLO_TIMEOUT_MS = (Number(config.hello_timeout_sec) || 12) * 1000;
+
+  function markPeerOnline(openId, name) {
+    if (!openId) return;
+    peerOnline.set(openId, { at: Date.now(), name: name || "" });
+  }
+  function isPeerOnline(openId) {
+    const rec = peerOnline.get(openId);
+    if (!rec) return false;
+    return Date.now() - rec.at <= (Number(config.peer_ttl_sec) || 300) * 1000;
+  }
+
+  /** 问对方「在吗」，等 PONG；超时返回 false */
+  function askOnline(targetOpenId, taskText) {
+    return new Promise((resolve) => {
+      const token = makeToken("H");
+      const timer = setTimeout(() => {
+        pendingHello.delete(token);
+        resolve(false);
+      }, HELLO_TIMEOUT_MS);
+      pendingHello.set(token, { target: targetOpenId, resolve, timer });
+      const body = '<at user_id="' + targetOpenId + '"></at> [HELLO|' + token + "] 在吗？"
+        + (taskText ? "（有件事：" + String(taskText).slice(0, 60) + "）" : "");
+      larkRun(["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, body);
+    });
+  }
+
+  /** 扫群历史，找 @ 自己的留言（上线时捡积压） */
+  async function collectMemos() {
+    const out = [];
+    try {
+      const r = await larkRun([
+        "im", "+chat-messages-list", "--chat-id", config.chat_id,
+        "--order", "desc", "--page-size", "50", "--as", "bot",
+      ], 45000);
+      if (!r.ok) return out;
+      let j = null;
+      try { j = JSON.parse(r.stdout); } catch { return out; }
+      const msgs = j?.data?.messages || j?.data?.items || [];
+      for (const m of msgs) {
+        const content = String(m.content || "");
+        const memo = parseMemo(content);
+        if (!memo) continue;
+        // 必须 @ 了本 bot 才算我的留言
+        const mentions = m.mentions || [];
+        if (!mentions.some((x) => x.id === config.bot_open_id)) continue;
+        const who = (m.mentions || []).find((x) => x.id === config.bot_open_id);
+        out.push({
+          ...memo,
+          at: m.create_time || "",
+          content: content.slice(0, 400),
+          // 留言者的 open_id（发言人）——用于上线时 @ 回去
+          fromOpenId: (m.sender_id || who?.id || ""),
+          fromName: m.sender_name || "",
+        });
       }
     } catch (e) {
-      log("presence: 心跳异常 " + String(e).slice(0, 140));
+      log("留言扫描失败：" + String(e).slice(0, 140));
     }
+    return out;
   }
 
   function saveState() {
@@ -409,7 +475,7 @@ export function createBridge(config, log, hooks = {}) {
 
   function larkRun(args, timeoutMs = 60_000, stdinData = null, cwd = null) {
     // 坑7：正文走 stdin（--text -），不用 @文件（lark-cli 路径白名单在宿主 cwd 下必挂）
-    // cwd：presence 的 @file 必须落在 lark-cli 白名单根（cwd / temp / ~/files）→ 用运行目录当 cwd
+    // cwd：lark-cli 的 @file 只认 cwd/账户temp/~/files → 需要读落盘文件时用运行目录当 cwd
     return new Promise((resolve) => {
       if (!larkEntry) return resolve({ ok: false, detail: "lark-cli 入口未找到" });
       const child = spawnLark(args, { stdinData, cwd });
@@ -467,6 +533,21 @@ export function createBridge(config, log, hooks = {}) {
     st.roster = { updated_at: Date.now(), identity: used, chat_id: config.chat_id, chat_name: (old.chat_id === config.chat_id ? old.chat_name : "") || "", members, truncations: j.data.truncations || [] };
     try { writeFileSync(rosterFile, JSON.stringify(st.roster, null, 2), "utf8"); } catch {}
     log("名册已更新（" + used + " 身份）：bot " + (j.data.bot_total ?? members.filter((m) => m.type === "bot").length) + " / user " + (j.data.user_total ?? members.filter((m) => m.type === "user").length));
+    // 自动探测：配置里没填 bot_open_id → 用「自己的 app_id」在名册里匹配出 member_id
+    if (!config.bot_open_id && !autodetectState.done) {
+      autodetectState.done = true;
+      const appId = await detectSelfAppId();
+      autodetectState.appId = appId;
+      const openId = matchSelfFromRoster(members, appId);
+      if (appId && openId) {
+        autodetectState.botOpenId = openId;
+        config.bot_open_id = openId;
+        log("✅ 自动探测到 bot_open_id = " + openId + "（按 app_id " + appId + " 匹配名册）");
+      } else {
+        log("⚠ 自动探测未命中（app_id=" + (appId || "未知") + "）—— 需在配置里手填 bot_open_id");
+        autodetectState.done = false;   // 下次再试
+      }
+    }
     return { ok: true, roster: st.roster };
   }
 
@@ -501,8 +582,7 @@ export function createBridge(config, log, hooks = {}) {
         writeFileSync(join(dir, "inbox", tag + ".json"), JSON.stringify({ task, pass, at: Date.now() }), "utf8");
       } catch {}
       st.lastTaskAt = Date.now();
-      const ackTag = pass?.taskId ? "ACK " + pass.taskId + " " : "";
-      await replyText(messageId, "✅ " + ackTag + "已收到，" + (config.device_name || "agent") + " 开始处理（最长 " + (config.task_timeout_sec || 300) + "s）…");
+      await replyText(messageId, "✅ 已收到，" + (config.device_name || "agent") + " 开始处理（最长 " + (config.task_timeout_sec || 300) + "s）…");
       if (!dshEntry) {
         await replyText(messageId, "⚠️ dsh 入口未找到（请在插件配置里填 dsh_entry），任务未执行。");
         return;
@@ -586,20 +666,6 @@ export function createBridge(config, log, hooks = {}) {
       const rec = findReceipt(evt, st.receipts);
       if (rec) {
         if (!isFinalReceipt(evt.content)) {
-          // ACK 往返：对方已接单 → 作为过程信号注回发起会话（不污染终态）
-          const ackM = String(evt.content || "").match(/ACK\s+([A-Za-z0-9_.\-]+)/);
-          if (ackM) {
-            log("对端 ACK（已接单） " + ackM[1] + " → 注回会话 " + rec.sessionId.slice(0, 22));
-            st.queue = st.queue.then(async () => {
-              try {
-                const text = "【飞书ACK|task=" + (rec.taskId || rec.messageId) + "】对方已接单：" + ackM[1];
-                if (typeof hooks.injectReceipt === "function") {
-                  await hooks.injectReceipt({ sessionId: rec.sessionId, text, requestId: "fleet-ack-" + rec.messageId });
-                }
-              } catch (e) { log("ACK 注回失败：" + String(e).slice(0, 140)); }
-            });
-            return;
-          }
           log("对端过程回执（不注回，等终态） " + String(rec.messageId).slice(0, 14));
           return;
         }
@@ -612,6 +678,39 @@ export function createBridge(config, log, hooks = {}) {
             log("回执注回成功 " + rec.sessionId.slice(0, 22));
           } catch (e) { log("回执注回失败：" + String(e).slice(0, 160)); }
         });
+        return;
+      }
+      const control = classifyControl(evt.content);
+      // —— 问-答/留言 专用通道：这些不是"任务"，不执行、不派活，只走各自的处理 ——
+      if (control === "hello") {
+        // 对方在问「在吗」→ 答「在」
+        const h = parseHello(evt.content);
+        const body = '<at user_id="' + (evt.sender_id || "") + '"></at> [PONG|' + (h?.token || "?") + "] 在";
+        st.queue = st.queue.then(() => larkRun(
+          ["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, body));
+        log("收到问询 " + (h?.token || "") + " → 已答「在」");
+        return;
+      }
+      if (control === "pong") {
+        // 对方答「在」→ 配对我方 pending 的问询
+        const p = parsePong(evt.content);
+        const hit = p ? pendingHello.get(p.token) : null;
+        if (hit) {
+          pendingHello.delete(p.token);
+          clearTimeout(hit.timer);
+          markPeerOnline(evt.sender_id, evt.sender_name);
+          log("收到应答 " + p.token + " → " + (evt.sender_name || evt.sender_id) + " 在线");
+          hit.resolve(true);
+        } else {
+          markPeerOnline(evt.sender_id, evt.sender_name);
+          log("收到应答（无配对）" + (p?.token || ""));
+        }
+        return;
+      }
+      if (control === "memo") {
+        // 留言：对方离线时留下的 → 上线后由 collectMemos 汇总上报，这里只记日志
+        const memo = parseMemo(evt.content);
+        log("收到留言 " + (memo?.taskId || "") + "（来自 " + (memo?.from || "?") + "）");
         return;
       }
       const r = routeEvent(evt, {
@@ -636,8 +735,6 @@ export function createBridge(config, log, hooks = {}) {
       }
       if (r.pass) {
         markDone(r.pass.taskId, r.pass.from);
-        st.lastTaskId = r.pass.taskId;
-        savePresenceCache();
         log("收到任务（路条 " + r.pass.taskId + " ← " + r.pass.from + " 深度" + r.pass.depth + "）: " + r.task.slice(0, 60));
       } else {
         log("收到任务 " + String(evt.message_id).slice(0, 14) + "…: " + r.task.slice(0, 80));
@@ -678,9 +775,12 @@ export function createBridge(config, log, hooks = {}) {
       "名册: " + (st.roster ? (st.roster.members || []).length + " 员（" + new Date(st.roster.updated_at).toLocaleString("sv-SE") + "，" + st.roster.identity + " 身份）" : "未拉取"),
       "最近事件: " + (s.lastEventAt ? new Date(s.lastEventAt).toLocaleString() : "无"),
       "最近任务: " + (s.lastTaskAt ? new Date(s.lastTaskAt).toLocaleString() : "无"),
-      "presence: " + (presence.enabled()
-        ? "已启用（间隔 " + Math.round(presence.intervalMs() / 1000) + "s / TTL " + Math.round(presence.ttlMs() / 1000) + "s）"
-        : "未启用（配 presence_base_token + presence_table_id 开启）"),
+      "bot_open_id: " + (config.bot_open_id
+        ? (autodetectState.botOpenId ? (autodetectState.botOpenId + "（自动探测）") : "（配置填写）")
+        : "⚠ 未探测到"),
+      "在线(问-答): " + (peerOnline.size
+        ? Array.from(peerOnline.entries()).map(([id, v]) => (v.name || id.slice(0, 12)) + (isPeerOnline(id) ? "🟢" : "⚪")).join("  ")
+        : "（尚未问过任何人）"),
     ];
     try {
       const logText = readFileSync(join(dir, "logs", "bridge.log"), "utf8").split("\n").filter(Boolean);
@@ -702,31 +802,39 @@ export function createBridge(config, log, hooks = {}) {
         roster: st.roster,
         doneTasks: doneTasks.length,
         queued: st.queue === Promise.resolve() ? 0 : 1,
-        presence: presence.status(),
       };
     },
     statusText,
     getRoster: () => st.roster,
     refreshRoster,
-    presence,
+    askOnline,
+    collectMemos,
+    isPeerOnline,
+    markPeerOnline,
+    pendingHello,
     start() {
-      const okCfg = config.chat_id && config.bot_open_id && config.device_name;
-      if (!okCfg) { log("配置不完整（device_name / chat_id / bot_open_id），桥未启动。请在插件配置里填写。"); return; }
-      presence.sweepTemp();
+      const needCfg = config.chat_id && config.device_name;
+      if (!needCfg) { log("配置不完整（device_name / chat_id），桥未启动。请在插件配置里填写。"); return; }
+      if (!config.bot_open_id) {
+        log("未配置 bot_open_id —— 尝试自动探测（拉名册后按自己的 app_id 匹配）");
+      }
       startConsume();
       st.queue = st.queue.then(() => refreshRoster().catch((e) => log("名册刷新异常：" + e))).then(async () => {
-        // Presence：上线写心跳（先解析自己的别名，再写）
-        if (presence.enabled()) {
-          const self = resolveSelfAlias();
-          presenceState.alias = self.alias;
-          if (!presenceState.appId) {
-            const m = (st.roster?.members || []).find((x) => x.open_id === config.bot_open_id);
-            if (m?.app_id) { presenceState.appId = m.app_id; savePresenceCache(); }
+        // 上线主动说一声：把之前留给我的留言汇总报出来
+        try {
+          const memos = await collectMemos();
+          if (memos.length) {
+            log("上线捡到 " + memos.length + " 条留言");
+            const lines = memos.slice(0, 10).map((m) => "· [" + m.taskId + "] 来自 " + m.from + "：" + String(m.content).replace(/\s+/g, " ").slice(0, 100));
+            const atPart = memos.map((m) => m.fromOpenId ? '<at user_id="' + m.fromOpenId + '"></at>' : "").join(" ");
+            const body = (atPart ? atPart + " " : "")
+              + "[" + (config.device_name || "agent") + "] 我上线了，有 " + memos.length + " 条留言：\n" + lines.join("\n");
+            await larkRun(["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, body);
+          } else {
+            log("上线检查：无留言");
           }
-          await heartbeat("online");
-          st.presenceTimer = setInterval(() => { heartbeat("online"); }, presence.intervalMs());
-          if (st.presenceTimer?.unref) st.presenceTimer.unref();
-          log("presence: 心跳已启动（间隔 " + Math.round(presence.intervalMs() / 1000) + "s，TTL " + Math.round(presence.ttlMs() / 1000) + "s）");
+        } catch (e) {
+          log("上线捡留言异常：" + String(e).slice(0, 140));
         }
       });
     },
@@ -741,26 +849,6 @@ export function createBridge(config, log, hooks = {}) {
         const q = String(mentionName).toLowerCase();
         const hit = (st.roster.members || []).find((m) => m.name === mentionName || String(m.name).toLowerCase().includes(q) || (m.aliases || []).some((a) => a.toLowerCase().includes(q)));
         if (hit) target = hit.open_id; else return { ok: false, content: "名册里找不到 \"" + mentionName + "\"，可用 fleet_roster 查看成员。" };
-      }
-      // Presence：派活前查接收方在线状态（离线 → 立即回报，不静默等死）
-      if (target && presence.enabled()) {
-        try {
-          const members = st.roster?.members || [];
-          const m = members.find((x) => x.open_id === target);
-          const appId = m?.app_id || "";
-          const name = m?.name || (target ? "" : "");
-          const hit = await presence.lookup({ appId, name });
-          if (hit && !hit.online) {
-            const lastSeen = hit.lastSeen || "(未知)";
-            const verdict = "⚠️ 接收方离线，未派活：" + (hit.device || hit.alias || target)
-              + "（last_seen=" + lastSeen + "，TTL " + Math.round(presence.ttlMs() / 1000) + "s 已超时）";
-            log("presence: 离线拦截 " + (hit.device || target));
-            return { ok: false, content: verdict + "（如需强发，去掉 presence 检查或先让对方上线）" };
-          }
-          if (hit) log("presence: 接收方在线 " + (hit.device || target) + " last_seen=" + hit.lastSeen);
-        } catch (e) {
-          log("presence: 查在线异常（放行）" + String(e).slice(0, 120));
-        }
       }
       let body = "[" + dev + "] " + text;
       if (target) body = '<at user_id="' + target + '"></at> ' + body;
@@ -786,9 +874,6 @@ export function createBridge(config, log, hooks = {}) {
     stop() {
       st.stopped = true;
       if (st.restartTimer) { clearTimeout(st.restartTimer); st.restartTimer = null; }
-      if (st.presenceTimer) { clearInterval(st.presenceTimer); st.presenceTimer = null; }
-      // Presence：正常退出主动宣布离线（加速收敛；崩溃场景由 TTL 兜底）
-      if (presence.enabled()) { try { presence.write({ status: "offline", taskId: st.lastTaskId || "", appId: presenceState.appId, alias: presenceState.alias, recordId: presenceState.recordId }); } catch {} }
       if (st.child) { try { st.child.kill(); } catch {} st.child = null; }
       st.running = false;
     },

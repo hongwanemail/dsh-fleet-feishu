@@ -117,6 +117,7 @@ export function findReceipt(evt, receipts, now = Date.now()) {
 }
 
 import { spawn } from "node:child_process";
+import { createPresence } from "./presence.js";
 import { existsSync, mkdirSync, appendFileSync, writeFileSync, readFileSync, statSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
@@ -259,7 +260,7 @@ export function createBridge(config, log, hooks = {}) {
 
   const st = {
     running: false, child: null, restartTimer: null, restartIdx: 0,
-    lastEventAt: null, lastTaskAt: null, queue: Promise.resolve(), stopped: false,
+    lastEventAt: null, lastTaskAt: null, lastTaskId: "", queue: Promise.resolve(), stopped: false,
     roster: readJsonSafe(rosterFile) || null,
     receipts: (readJsonSafe(receiptsFile)?.receipts || []).filter((r) => r.expires > Date.now()),
     resume: readJsonSafe(resumeFile) || null,
@@ -293,6 +294,59 @@ export function createBridge(config, log, hooks = {}) {
   }
   const fixedSession = () => String(config.session_id || "").trim();
 
+  // ---- Presence（MQTT 风格在线感知，载体=多维表格心跳表）----
+  const presence = createPresence({ config, log, larkRun, workDir: dir });
+  const presenceState = { recordId: "", appId: "", alias: "" };
+  function loadPresenceCache() {
+    const f = join(dir, "presence.json");
+    const saved = readJsonSafe(f);
+    if (saved?.record_id) presenceState.recordId = saved.record_id;
+    if (saved?.app_id) presenceState.appId = saved.app_id;
+  }
+  function savePresenceCache() {
+    try { writeFileSync(join(dir, "presence.json"), JSON.stringify({
+      record_id: presenceState.recordId, app_id: presenceState.appId,
+    }), "utf8"); } catch {}
+  }
+  loadPresenceCache();
+
+  // 从名册里找"自己"：用 app_id（全局唯一、视角无关）匹配
+  function resolveSelfAlias() {
+    const myApp = presenceState.appId || "";
+    const members = st.roster?.members || [];
+    if (myApp) {
+      const hit = members.find((m) => m.app_id === myApp);
+      if (hit) return { alias: hit.name || "", openId: hit.open_id || "" };
+    }
+    // 退化：按 bot_open_id 匹配
+    const hit2 = members.find((m) => m.open_id === config.bot_open_id);
+    return hit2 ? { alias: hit2.name || "", openId: hit2.open_id || "" } : { alias: "", openId: "" };
+  }
+
+  async function heartbeat(status) {
+    if (!presence.enabled()) return;
+    try {
+      if (!presenceState.recordId && !presenceState.appId) {
+        // 首次：找已有行（可能上次创建过但没缓存 id）
+        const self = await presence.findSelfRow(presenceState.appId, config.device_name);
+        if (self) presenceState.recordId = self.recordId || "";
+      }
+      const r = await presence.write({
+        status,
+        taskId: st.lastTaskId || "",
+        appId: presenceState.appId,
+        alias: presenceState.alias,
+        recordId: presenceState.recordId,
+      });
+      if (r.ok) {
+        if (r.recordId) presenceState.recordId = r.recordId;
+        savePresenceCache();
+      }
+    } catch (e) {
+      log("presence: 心跳异常 " + String(e).slice(0, 140));
+    }
+  }
+
   function saveState() {
     try { writeFileSync(stateFile, JSON.stringify({ session_id: state.sessionId, cwd: state.cwd }), "utf8"); } catch {}
   }
@@ -308,6 +362,7 @@ export function createBridge(config, log, hooks = {}) {
       stdio: [stdin, "pipe", "pipe"],
       env,
       windowsHide: true,
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
     });
   }
 
@@ -352,11 +407,12 @@ export function createBridge(config, log, hooks = {}) {
     return pids.length;
   }
 
-  function larkRun(args, timeoutMs = 60_000, stdinData = null) {
+  function larkRun(args, timeoutMs = 60_000, stdinData = null, cwd = null) {
     // 坑7：正文走 stdin（--text -），不用 @文件（lark-cli 路径白名单在宿主 cwd 下必挂）
+    // cwd：presence 的 @file 必须落在 lark-cli 白名单根（cwd / temp / ~/files）→ 用运行目录当 cwd
     return new Promise((resolve) => {
       if (!larkEntry) return resolve({ ok: false, detail: "lark-cli 入口未找到" });
-      const child = spawnLark(args, { stdinData });
+      const child = spawnLark(args, { stdinData, cwd });
       let out = "", err = "";
       const timer = setTimeout(() => { try { child.kill(); } catch {} }, timeoutMs);
       child.stdout.on("data", (d) => { out += d; });
@@ -445,7 +501,8 @@ export function createBridge(config, log, hooks = {}) {
         writeFileSync(join(dir, "inbox", tag + ".json"), JSON.stringify({ task, pass, at: Date.now() }), "utf8");
       } catch {}
       st.lastTaskAt = Date.now();
-      await replyText(messageId, "✅ 已收到，" + (config.device_name || "agent") + " 开始处理（最长 " + (config.task_timeout_sec || 300) + "s）…");
+      const ackTag = pass?.taskId ? "ACK " + pass.taskId + " " : "";
+      await replyText(messageId, "✅ " + ackTag + "已收到，" + (config.device_name || "agent") + " 开始处理（最长 " + (config.task_timeout_sec || 300) + "s）…");
       if (!dshEntry) {
         await replyText(messageId, "⚠️ dsh 入口未找到（请在插件配置里填 dsh_entry），任务未执行。");
         return;
@@ -529,6 +586,20 @@ export function createBridge(config, log, hooks = {}) {
       const rec = findReceipt(evt, st.receipts);
       if (rec) {
         if (!isFinalReceipt(evt.content)) {
+          // ACK 往返：对方已接单 → 作为过程信号注回发起会话（不污染终态）
+          const ackM = String(evt.content || "").match(/ACK\s+([A-Za-z0-9_.\-]+)/);
+          if (ackM) {
+            log("对端 ACK（已接单） " + ackM[1] + " → 注回会话 " + rec.sessionId.slice(0, 22));
+            st.queue = st.queue.then(async () => {
+              try {
+                const text = "【飞书ACK|task=" + (rec.taskId || rec.messageId) + "】对方已接单：" + ackM[1];
+                if (typeof hooks.injectReceipt === "function") {
+                  await hooks.injectReceipt({ sessionId: rec.sessionId, text, requestId: "fleet-ack-" + rec.messageId });
+                }
+              } catch (e) { log("ACK 注回失败：" + String(e).slice(0, 140)); }
+            });
+            return;
+          }
           log("对端过程回执（不注回，等终态） " + String(rec.messageId).slice(0, 14));
           return;
         }
@@ -565,6 +636,8 @@ export function createBridge(config, log, hooks = {}) {
       }
       if (r.pass) {
         markDone(r.pass.taskId, r.pass.from);
+        st.lastTaskId = r.pass.taskId;
+        savePresenceCache();
         log("收到任务（路条 " + r.pass.taskId + " ← " + r.pass.from + " 深度" + r.pass.depth + "）: " + r.task.slice(0, 60));
       } else {
         log("收到任务 " + String(evt.message_id).slice(0, 14) + "…: " + r.task.slice(0, 80));
@@ -605,6 +678,9 @@ export function createBridge(config, log, hooks = {}) {
       "名册: " + (st.roster ? (st.roster.members || []).length + " 员（" + new Date(st.roster.updated_at).toLocaleString("sv-SE") + "，" + st.roster.identity + " 身份）" : "未拉取"),
       "最近事件: " + (s.lastEventAt ? new Date(s.lastEventAt).toLocaleString() : "无"),
       "最近任务: " + (s.lastTaskAt ? new Date(s.lastTaskAt).toLocaleString() : "无"),
+      "presence: " + (presence.enabled()
+        ? "已启用（间隔 " + Math.round(presence.intervalMs() / 1000) + "s / TTL " + Math.round(presence.ttlMs() / 1000) + "s）"
+        : "未启用（配 presence_base_token + presence_table_id 开启）"),
     ];
     try {
       const logText = readFileSync(join(dir, "logs", "bridge.log"), "utf8").split("\n").filter(Boolean);
@@ -626,16 +702,33 @@ export function createBridge(config, log, hooks = {}) {
         roster: st.roster,
         doneTasks: doneTasks.length,
         queued: st.queue === Promise.resolve() ? 0 : 1,
+        presence: presence.status(),
       };
     },
     statusText,
     getRoster: () => st.roster,
     refreshRoster,
+    presence,
     start() {
       const okCfg = config.chat_id && config.bot_open_id && config.device_name;
       if (!okCfg) { log("配置不完整（device_name / chat_id / bot_open_id），桥未启动。请在插件配置里填写。"); return; }
+      presence.sweepTemp();
       startConsume();
-      st.queue = st.queue.then(() => refreshRoster().catch((e) => log("名册刷新异常：" + e)));
+      st.queue = st.queue.then(() => refreshRoster().catch((e) => log("名册刷新异常：" + e))).then(async () => {
+        // Presence：上线写心跳（先解析自己的别名，再写）
+        if (presence.enabled()) {
+          const self = resolveSelfAlias();
+          presenceState.alias = self.alias;
+          if (!presenceState.appId) {
+            const m = (st.roster?.members || []).find((x) => x.open_id === config.bot_open_id);
+            if (m?.app_id) { presenceState.appId = m.app_id; savePresenceCache(); }
+          }
+          await heartbeat("online");
+          st.presenceTimer = setInterval(() => { heartbeat("online"); }, presence.intervalMs());
+          if (st.presenceTimer?.unref) st.presenceTimer.unref();
+          log("presence: 心跳已启动（间隔 " + Math.round(presence.intervalMs() / 1000) + "s，TTL " + Math.round(presence.ttlMs() / 1000) + "s）");
+        }
+      });
     },
     async send({ text, mentionOpenId, mentionName, chatId, identity, ownerSessionId }) {
       // fleet_send 执行体：text + <at user_id>（纯文本）。v1.2：身份=config.send_identity/本次 override
@@ -648,6 +741,26 @@ export function createBridge(config, log, hooks = {}) {
         const q = String(mentionName).toLowerCase();
         const hit = (st.roster.members || []).find((m) => m.name === mentionName || String(m.name).toLowerCase().includes(q) || (m.aliases || []).some((a) => a.toLowerCase().includes(q)));
         if (hit) target = hit.open_id; else return { ok: false, content: "名册里找不到 \"" + mentionName + "\"，可用 fleet_roster 查看成员。" };
+      }
+      // Presence：派活前查接收方在线状态（离线 → 立即回报，不静默等死）
+      if (target && presence.enabled()) {
+        try {
+          const members = st.roster?.members || [];
+          const m = members.find((x) => x.open_id === target);
+          const appId = m?.app_id || "";
+          const name = m?.name || (target ? "" : "");
+          const hit = await presence.lookup({ appId, name });
+          if (hit && !hit.online) {
+            const lastSeen = hit.lastSeen || "(未知)";
+            const verdict = "⚠️ 接收方离线，未派活：" + (hit.device || hit.alias || target)
+              + "（last_seen=" + lastSeen + "，TTL " + Math.round(presence.ttlMs() / 1000) + "s 已超时）";
+            log("presence: 离线拦截 " + (hit.device || target));
+            return { ok: false, content: verdict + "（如需强发，去掉 presence 检查或先让对方上线）" };
+          }
+          if (hit) log("presence: 接收方在线 " + (hit.device || target) + " last_seen=" + hit.lastSeen);
+        } catch (e) {
+          log("presence: 查在线异常（放行）" + String(e).slice(0, 120));
+        }
       }
       let body = "[" + dev + "] " + text;
       if (target) body = '<at user_id="' + target + '"></at> ' + body;
@@ -673,6 +786,9 @@ export function createBridge(config, log, hooks = {}) {
     stop() {
       st.stopped = true;
       if (st.restartTimer) { clearTimeout(st.restartTimer); st.restartTimer = null; }
+      if (st.presenceTimer) { clearInterval(st.presenceTimer); st.presenceTimer = null; }
+      // Presence：正常退出主动宣布离线（加速收敛；崩溃场景由 TTL 兜底）
+      if (presence.enabled()) { try { presence.write({ status: "offline", taskId: st.lastTaskId || "", appId: presenceState.appId, alias: presenceState.alias, recordId: presenceState.recordId }); } catch {} }
       if (st.child) { try { st.child.kill(); } catch {} st.child = null; }
       st.running = false;
     },

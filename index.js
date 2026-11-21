@@ -54,6 +54,13 @@ export const Config = Schema.object({
   headless_workspace: Schema.string().default(""),
   lark_entry: Schema.string().default(""),
   dsh_entry: Schema.string().default(""),
+  // Presence（MQTT 风格在线感知，载体=多维表格心跳表）：
+  // 填 base_token + table_id 即启用；留空 = 完全不启用（零开销）
+  presence_base_token: Schema.string().default(""),
+  presence_table_id: Schema.string().default(""),
+  presence_interval_sec: Schema.number().default(60),
+  presence_ttl_sec: Schema.number().default(90),
+  presence_version: Schema.string().default(""),
 });
 
 function checkConfig(config) {
@@ -125,6 +132,34 @@ export function apply(ctx, config) {
       });
       return r.content;
     }
+  ));
+
+  ctx.tools.register(textTool(
+    "fleet_presence",
+    "查看舰队各设备的在线状态（Presence 心跳表）：每台设备的 last_seen、状态（在线/离线由 TTL 判定）、当前任务、插件版本。用于派活前确认对方是否在线，避免“消息发出去没人接”。未配置心跳表时返回未启用。",
+    {},
+    async () => {
+      const pres = bridge.presence;
+      if (!pres || !pres.enabled()) {
+        return "Presence 未启用：在插件配置里填 presence_base_token 与 presence_table_id（多维表格的 base_token 与 table_id）后生效。";
+      }
+      const rows = await pres.list();
+      if (!rows.length) return "心跳表里还没有记录（各设备上线后会自动写入）。";
+      const now = Date.now();
+      const lines = rows.map((r) => {
+        const online = pres.judgeOnline(r, now);
+        const last = r.lastSeen ? r.lastSeen.replace("T", " ").slice(0, 19) : "(未知)";
+        return "- " + (r.device || r.alias || "(未命名)")
+          + "  " + (online ? "🟢 在线" : "🔴 离线")
+          + "  last_seen=" + last
+          + "  状态=" + (r.status || "?")
+          + (r.task ? "  最后任务=" + r.task : "")
+          + (r.version ? "  版本=" + r.version : "")
+          + (r.appId ? "  app=" + r.appId.slice(0, 10) + "…" : "");
+      });
+      return "舰队在线状态（TTL " + Math.round(pres.ttlMs() / 1000) + "s，超时判离线）：\n" + lines.join("\n");
+    },
+    () => true
   ));
 
   ctx.tools.register(textTool(

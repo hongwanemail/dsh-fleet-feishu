@@ -2,7 +2,7 @@
 // 覆盖：路条硬闸（bot 无路条拒收/深度超限/同任务回环）、reply 继承闸、回执前缀闸、
 //       群内指令识别（仅 user 且无路条）、mention/群/消息类型过滤。
 import assert from "node:assert/strict";
-import { routeEvent, parseTaskPass, findReceipt, isBotReply, isFinalReceipt, shouldTrackReceipt, parseHello, parsePong, parseMemo, classifyControl, makeToken } from "../bridge.js";
+import { routeEvent, parseTaskPass, findReceipt, isBotReply, isFinalReceipt, shouldTrackReceipt, parseHello, parsePong, parseMemo, classifyControl, makeToken, parseSetup } from "../bridge.js";
 
 const CFG = { chat_id: "oc_test", bot_open_id: "ou_bot_self", max_depth: 3 };
 const M = (id) => [{ id, key: "@_user_1", name: "小鲸鱼-测试" }];
@@ -192,5 +192,32 @@ t("classifyControl 普通消息不匹配", () => assert.equal(classifyControl("�
 t("makeToken 生成可配对 token", () => assert.match(makeToken("H"), /^H-[a-z0-9]+-[a-z0-9]+$/));
 t("makeToken 不重复", () => assert.notEqual(makeToken("H"), makeToken("H")));
 t("问询消息走专用通道（不当任务执行）", () => assert.equal(classifyControl("[HELLO|tok-9] 在吗？"), "hello"));
+
+
+// ===== 群内绑定指令（v1.8.0）=====
+t("parseSetup 返回空对象（非指令）", () => assert.equal(parseSetup("你好"), null));
+t("parseSetup 返回空对象（非指令）", () => assert.equal(parseSetup("发业务"), null));
+t("parseSetup 只有指令时两项为空", () => {
+  const r = parseSetup("/setup");
+  assert.equal(r.chatId, "");
+  assert.equal(r.deviceName, "");
+});
+t("parseSetup 解析群 ID + 署名", () => {
+  const r = parseSetup("/setup oc_abc123 办公室PC");
+  assert.equal(r.chatId, "oc_abc123");
+  assert.equal(r.deviceName, "办公室PC");
+});
+t("parseSetup 只给群 ID", () => {
+  const r = parseSetup("/setup oc_abc123");
+  assert.equal(r.chatId, "oc_abc123");
+  assert.equal(r.deviceName, "");
+});
+t("parseSetup 只给名字", () => {
+  const r = parseSetup("/setup 我的机器人");
+  assert.equal(r.chatId, "");
+  assert.equal(r.deviceName, "我的机器人");
+});
+t("classifyControl 识别 setup", () => assert.equal(classifyControl("/setup oc_x 名"), "setup"));
+t("setup 指令不当任务执行", () => assert.equal(classifyControl("/setup") === "setup", true));
 
 console.log(`\n${n} 项断言完成，exitCode=${process.exitCode || 0}`);

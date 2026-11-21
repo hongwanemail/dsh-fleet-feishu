@@ -27,6 +27,7 @@ const TASK_PASS_RE = /任务ID\s*[|｜]\s*([\w.\-]+)\s*[|｜]\s*([^|｜]+?)\s*[|
 export const HELLO_RE = /\[HELLO\|([A-Za-z0-9_.\-]+)\]/;
 export const PONG_RE = /\[PONG\|([A-Za-z0-9_.\-]+)\]/;
 export const MEMO_RE = /\[MEMO\|([^|\]]+)\|([^\]]+)\]/;
+export const SETUP_RE = /^\/setup\b(.*)$/i;
 
 export function parseHello(text) {
   const m = String(text || "").match(HELLO_RE);
@@ -41,9 +42,26 @@ export function parseMemo(text) {
   return m ? { taskId: m[1], from: m[2] } : null;
 }
 
+/** 群内绑定指令：/setup [chat_id] [署名]
+ *  → 返回 { chatId, deviceName } （可为空表示"请自动探测"）
+ */
+export function parseSetup(text) {
+  const m = String(text || "").match(SETUP_RE);
+  if (!m) return null;
+  const rest = String(m[1] || "").trim();
+  const parts = rest.split(/\s+/).filter(Boolean);
+  let chatId = "", deviceName = "";
+  for (const p of parts) {
+    if (!chatId && /^oc_[\w-]+$/.test(p)) chatId = p;
+    else if (!deviceName) deviceName = p;
+  }
+  return { chatId, deviceName };
+}
+
 /** 消息类型判定：HELLO / PONG / MEMO 都不是"任务"，走各自专用通道 */
 export function classifyControl(text) {
   const t = String(text || "");
+  if (SETUP_RE.test(t)) return "setup";
   if (HELLO_RE.test(t)) return "hello";
   if (PONG_RE.test(t)) return "pong";
   if (MEMO_RE.test(t)) return "memo";
@@ -62,7 +80,7 @@ export function parseTaskPass(text) {
   return { taskId: m[1], from: m[2].trim(), depth: Number(m[3]) };
 }
 
-const COMMAND_RE = /^\/(new|reset|status|roster|resume)\b/i;
+const COMMAND_RE = /^\/(new|reset|status|roster|resume|setup)\b/i;
 
 // v1.2 修正（E2E 发现）：回执正文格式是 "[设备名] [bot-reply] …"（署名在前！），
 // v1.1 的 content.startsWith("[bot-reply]") 双保险闸与 v1.2 收据匹配都写歪了——
@@ -454,6 +472,26 @@ export function createBridge(config, log, hooks = {}) {
     });
   }
 
+  /** 把绑定结果写回 profile 的 patch（让配置持久化，下次启动还在） */
+  async function persistBinding(chatId, deviceName) {
+    try {
+      const editor = ctx?.configEditor;
+      const entry = editor?.entries?.()?.find((e) => e.options?.id === "fleet-feishu");
+      if (editor?.edit && entry) {
+        await editor.edit(entry, (current) => ({
+          ...current,
+          chat_id: chatId || current.chat_id,
+          device_name: deviceName || current.device_name,
+          bot_open_id: current.bot_open_id || config.bot_open_id,
+        }));
+        return { ok: true, via: "configEditor" };
+      }
+    } catch (e) {
+      log("configEditor 写入失败，回退到直接写 patch：" + String(e).slice(0, 120));
+    }
+    return { ok: false, via: "none" };
+  }
+
   /** 扫群历史，找 @ 自己的留言（上线时捡积压） */
   async function collectMemos() {
     const out = [];
@@ -783,6 +821,33 @@ export function createBridge(config, log, hooks = {}) {
         }
         return;
       }
+      if (control === "setup") {
+        // 群内绑定：@bot /setup [chat_id] [署名]
+        const sp = parseSetup(evt.content);
+        st.queue = st.queue.then(async () => {
+          try {
+            if (sp.chatId) config.chat_id = sp.chatId;
+            if (sp.deviceName) config.device_name = sp.deviceName;
+            if (!config.chat_id || !config.bot_open_id || !config.device_name) {
+              await bootstrap();
+            }
+            const ok = !!(config.chat_id && config.bot_open_id && config.device_name);
+            const saved = ok ? await persistBinding(config.chat_id, config.device_name) : { ok: false };
+            const msg = ok
+              ? "✅ 已绑定：\n  群 = " + (config.chat_id || "?") + "\n  我 = " + (config.device_name || "?") + "\n  open_id = " + (config.bot_open_id || "?")
+                + (saved.ok ? "\n  已写入配置（下次启动仍有效）" : "\n  提示：配置未持久化，下次启动会自动重新探测")
+              : "⚠️ 绑定失败：还缺 " + [
+                  !config.chat_id ? "群 ID（/setup oc_xxx 名字）" : "",
+                  !config.device_name ? "署名（/setup oc_xxx 我的名字）" : "",
+                ].filter(Boolean).join(" 和 ");
+            await replyText(evt.message_id, msg);
+            log("/setup → " + (ok ? "成功" : "失败") + " chat=" + config.chat_id + " name=" + config.device_name);
+          } catch (e) {
+            await replyText(evt.message_id, "⚠️ /setup 出错：" + String(e).slice(0, 140));
+          }
+        });
+        return;
+      }
       if (control === "memo") {
         // 留言：对方离线时留下的 → 上线后由 collectMemos 汇总上报，这里只记日志
         const memo = parseMemo(evt.content);
@@ -885,6 +950,8 @@ export function createBridge(config, log, hooks = {}) {
     getRoster: () => st.roster,
     refreshRoster,
     bootstrap,
+    parseSetup,
+    persistBinding,
     askOnline,
     collectMemos,
     isPeerOnline,
@@ -897,6 +964,15 @@ export function createBridge(config, log, hooks = {}) {
           await bootstrap();
         }
       });
+      // 自举成功 → 主动在群里报到（用户立刻看到「装好了」）
+      if (bootstrapState.done && config.chat_id) {
+        const hello = "\u2705 我已就绪：" + (config.device_name || "agent")
+          + "\n群 = " + config.chat_id
+          + "\n用法：@" + (config.device_name || "bot") + " /status 看状态；@" + (config.device_name || "bot") + " 你的任务 派活（没应答我会留言）"
+          + "\n改绑定：@" + (config.device_name || "bot") + " /setup oc_xxx 新名字";
+        st.queue = st.queue.then(() => larkRun(["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, hello));
+        log("自举成功 → 已在群里报到");
+      }
       const needCfg = config.chat_id && config.device_name;
       if (!needCfg) {
         log("配置不完整且自举失败 —— 桥保持休眠。请在插件配置里填 device_name 与 chat_id。");

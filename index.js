@@ -10,7 +10,7 @@
 // 生命周期：apply 时按配置启动桥接；配置变更触发插件重启（apply 重跑），cleanup 自动停旧桥。
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import Schema from "@deepseek-ai/schemastery";
-import { createBridge, makeLogger, runtimeDir, parseTaskPass } from "./bridge.js";
+import { createBridge, makeLogger, runtimeDir, parseTaskPass, cfgValue } from "./bridge.js";
 
 export const name = "fleet-feishu";
 export const inject = ["tools", "timer", "agents"];
@@ -104,12 +104,18 @@ export const Config = Schema.object({
 });
 
 function checkConfig(config) {
+  // 官方规定：volatile 字段的运行时值是 Volatile<T> 引用，要 .get() 读。
+  // DSH 0.2.2-rc.5 起生效；直接拿 config.chat_id 做正则匹配会拿到对象 → 误报「配置未就绪」。
   const problems = [];
-  if (!config.device_name || config.device_name === "未命名设备") problems.push("device_name 未设置（群里署名用）");
-  if (!/^oc_[\w-]+$/.test(config.chat_id || "")) problems.push("chat_id 未设置或不是 oc_ 开头的群 ID");
+  const deviceName = cfgValue(config.device_name);
+  const chatId = cfgValue(config.chat_id);
+  const botOpenId = cfgValue(config.bot_open_id);
+  const timeout = cfgValue(config.task_timeout_sec);
+  if (!deviceName || deviceName === "未命名设备") problems.push("device_name 未设置（群里署名用）");
+  if (!/^oc_[\w-]+$/.test(chatId || "")) problems.push("chat_id 未设置或不是 oc_ 开头的群 ID");
   // bot_open_id 留空可运行：桥会拉名册后按自己的 app_id 自动匹配（实测可靠）
-  if (config.bot_open_id && !/^ou_[\w-]+$/.test(config.bot_open_id)) problems.push("bot_open_id 格式不对（ou_ 开头）；留空则自动探测");
-  if (typeof config.task_timeout_sec !== "number" || config.task_timeout_sec <= 0) problems.push("task_timeout_sec 必须为正数");
+  if (botOpenId && !/^ou_[\w-]+$/.test(botOpenId)) problems.push("bot_open_id 格式不对（ou_ 开头）");
+  if (typeof timeout !== "number" || timeout <= 0) problems.push("task_timeout_sec 必须为正数");
   return problems;
 }
 
@@ -136,7 +142,7 @@ export function apply(ctx, config) {
   });
 
   // 名册定时刷新（roster_interval_min 分钟，0/未配=默认 60；-1 关闭）
-  const intervalMin = config.roster_interval_min === undefined ? 60 : Number(config.roster_interval_min);
+  const intervalMin = cfgValue(config.roster_interval_min) === undefined ? 60 : Number(cfgValue(config.roster_interval_min));
   if (problems.length === 0 && intervalMin > 0) {
     ctx.effect(() => ctx.timer.interval(() => { bridge.refreshRoster().catch(() => {}); }, intervalMin * 60_000));
   }
@@ -185,7 +191,7 @@ export function apply(ctx, config) {
       const act = (args?.action || "show");
       if (act === "ping") {
         const rows = bridge.getRoster()?.members || [];
-        const bots = rows.filter((m) => m.type === "bot" && m.open_id !== config.bot_open_id);
+        const bots = rows.filter((m) => m.type === "bot" && m.open_id !== cfgValue(config.bot_open_id));
         const out = [];
         for (const b of bots) {
           const ok = await bridge.askOnline(b.open_id, "ping");

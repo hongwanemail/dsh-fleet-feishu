@@ -46,6 +46,24 @@ export const Config = Schema.object({
     .description("dsh 可执行入口绝对路径；留空 = 自动探测。"),
 });
 
+/** 工具封装：回答是字符串，渲染为一段文本。
+ *  官方规范：output.render 必须提供（否则工具调用报
+ *  "output.render failed: userRender is not a function"）。 */
+function textTool(name, description, parameters, execute) {
+  return defineTool({
+    name,
+    description,
+    parameters,
+    output: {
+      schema: { type: "string" },
+      render: (_args, value) => [{ type: "text", text: String(value ?? "") }],
+    },
+    async execute(args) {
+      return String(await execute(args));
+    },
+  });
+}
+
 /** 飞书 @ 提及的正文片段。 */
 function atTag(openId, name) {
   return '<at user_id="' + openId + '">' + (name || "") + "</at>";
@@ -107,12 +125,11 @@ export function apply(ctx, config) {
 
   // ---------- 工具 ----------
 
-  ctx.tools.register(defineTool({
-    name: "fleet_status",
-    description: "查看本机「Agent 调度-飞书群」桥接的运行状态：是否在监听群消息、bot 身份、已处理的群与任务、最近错误。",
-    parameters: {},
-    output: { schema: { type: "string" } },
-    async execute() {
+  ctx.tools.register(textTool(
+    "fleet_status",
+    "查看本机「Agent 调度-飞书群」桥接的运行状态：是否在监听群消息、bot 身份、已处理的群与任务、最近错误。",
+    {},
+    async () => {
       const s = bridge.status();
       const lines = [
         "运行中: " + (s.running ? "是" : "否"),
@@ -125,19 +142,18 @@ export function apply(ctx, config) {
       ];
       if (s.lastError) lines.push("最近错误: " + s.lastError);
       return lines.join("\n");
-    },
-  }));
+    }
+  ));
 
-  ctx.tools.register(defineTool({
-    name: "fleet_send",
-    description: "向 Agent 调度群发消息（bot 身份）。可 @ 某个 bot 或人（mention_open_id）。给其它设备 agent 派活时正文必须带路条 [任务ID|发起人|派发深度N]。",
-    parameters: {
+  ctx.tools.register(textTool(
+    "fleet_send",
+    "向 Agent 调度群发消息（bot 身份）。可 @ 某个 bot 或人（mention_open_id）。给其它设备 agent 派活时正文必须带路条 [任务ID|发起人|派发深度N]。",
+    {
       text: { type: "string", required: true, description: "要发送的正文（纯文本；@ 提及用 mention_open_id 参数，不要手写标签）" },
       mention_open_id: { type: "string", description: "要 @ 的目标 open_id（ou_ 开头）" },
       chat_id: { type: "string", description: "目标群 ID；省略则发到插件监控的群" },
     },
-    output: { schema: { type: "string" } },
-    async execute(args) {
+    async (args) => {
       const text = String(args?.text || "").trim();
       if (!text) return "text 不能为空";
       const s = bridge.status();
@@ -154,17 +170,16 @@ export function apply(ctx, config) {
       } catch (e) {
         return "发送失败：" + String(e.message || e).slice(0, 300);
       }
-    },
-  }));
+    }
+  ));
 
-  ctx.tools.register(defineTool({
-    name: "fleet_roster",
-    description: "查看「Agent 调度群」成员名册（机器人与人名 + open_id + app_id）。action=show 显示缓存，action=refresh 现拉再显示。",
-    parameters: {
+  ctx.tools.register(textTool(
+    "fleet_roster",
+    "查看「Agent 调度群」成员名册（机器人与人名 + open_id + app_id）。action=show 显示缓存，action=refresh 现拉再显示。",
+    {
       action: { type: "string", description: "show=读缓存名册（默认），refresh=调飞书接口现拉再显示" },
     },
-    output: { schema: { type: "string" } },
-    async execute(args) {
+    async (args) => {
       const s = bridge.status();
       if (!s.chatIds.length) return "还没有探测到群（机器人是否已加入群？）。";
       const chatId = s.chatIds[0];
@@ -177,17 +192,16 @@ export function apply(ctx, config) {
       const lines = members.map((m) =>
         "- " + (m.name || "?") + " [" + (m.appId ? "bot" : "user") + "] " + m.memberId + (m.appId ? " app=" + m.appId : ""));
       return "群名册 " + members.length + " 员（chat=" + chatId + "，" + (s.chatNames[chatId] || "") + "）：\n" + lines.join("\n");
-    },
-  }));
+    }
+  ));
 
-  ctx.tools.register(defineTool({
-    name: "fleet_online",
-    description: "查看各设备最近一次在群里发言的时间（群里谁活跃＝谁在线）。action=show 看记录，action=ping 主动问一圈谁在线。",
-    parameters: {
+  ctx.tools.register(textTool(
+    "fleet_online",
+    "查看各设备最近一次在群里发言的时间（群里谁活跃＝谁在线）。action=show 看记录，action=ping 主动问一圈谁在线。",
+    {
       action: { type: "string", description: "show=看已知在线状态（默认），ping=主动问一圈" },
     },
-    output: { schema: { type: "string" } },
-    async execute(args) {
+    async (args) => {
       const s = bridge.status();
       const peers = bridge.peerActivity();
       if ((args?.action || "show") === "ping") {
@@ -203,8 +217,8 @@ export function apply(ctx, config) {
         return "- " + (p.name || p.openId) + "  " + (on ? "🟢 在线" : "⚪ 未知") + "  最后发言 " + (p.lastAt ? new Date(p.lastAt).toLocaleString("zh-CN") : "无");
       });
       return "设备在线状态（按群内发言推断）：\n" + (lines.join("\n") || "（还没看到别的 bot 发言）");
-    },
-  }));
+    }
+  ));
 
   return () => bridge.stop();
 }

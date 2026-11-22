@@ -1,193 +1,112 @@
 # fleet-feishu —— 把你的 DSH 变成飞书群里的员工 🐳
 
-**多设备 AI agent 协作调度插件**：每台电脑装一个，群里的机器人就是那台电脑的 DeepSeek Harness。
-@ 它派活，它在本机执行并回帖；机器人之间带"路条"互相派活协作；结果自动注回你的会话——**派完不用盯群**。
+**多设备 AI agent 协作调度插件**。每台电脑装一个，群里的机器人就是那台电脑的 DeepSeek Harness：
+@ 它派活，它在本机执行并回帖。
 
-> ⭐ 适用于：家里有 Windows、办公室有 Mac、手里还有服务器的人（设备多到管不过来的人）。
+> **只要两个参数**：飞书应用的 **App ID** + **App Secret**。
+> 群不用填 —— 机器人被拉进群后，插件自己找得到；消息自己收；活自己干；结果自己回。
+> **不需要装 lark-cli，不需要扫码登录，不需要手填群 ID。**
 
 ```
 老板（手机/桌面）──飞书群──▶ 🤖 小鲸鱼-笔记本 ──路条──▶ 🤖 小鲸鱼-办公机 ──▶ 本机 dsh 执行
-                                       ▲                        │
-                                       └──── 🔗 结果自动注回 ◀──┘
+                                         ▲                        │
+                                         └──── 🔗 结果回到群里 ◀──┘
 ```
 
-## 特性
+## 快速开始（三步）
 
-- 📱 **群里 @ 就干活**：任务经 `dsh headless` 在本机执行，结果回帖，上下文延续（`/new` 重开会话）
-- 🤝 **机器人互相派活**：路条协议 `[任务ID|发起人|派发深度N]`，深度硬闸 + 同任务回环吸收
-- 🔔 **回执注回**：派出去的活，完成结果自动出现在你的 DSH 会话里，不用守群轮询
-- 👥 **群名册**：成员/别名模糊匹配，`fleet_roster` 随手可查
-- 🛡 **安全边界**：只有 @ 到本 bot 的顶层指令才执行；真人免检、agent 必须持证；密钥只存本机凭据库
-- 🖥 **跨平台**：Windows / macOS / Linux；桌面客户端与 `dsh --profile fleet` 无头守护两种形态
+### 1️⃣ 装插件
 
-## 安装
+DSH → **插件** → **添加插件** → 填：
 
-### 方式 A：从 GitHub 安装（推荐，无需构建）
-
-```bash
-dsh plugin --profile desktop add github:hongwanemail/dsh-fleet-feishu
+```
+https://github.com/hongwanemail/dsh-fleet-feishu
 ```
 
-本包是**纯 JavaScript**（无编译步骤、无 `build` 脚本），因此 pnpm **不会要求你授权 `allowBuilds`**——
-不需要在 `pnpm-workspace.yaml` 里开任何构建开关，安装即可用。
+装完启用即可。**纯 JavaScript，无编译步骤**，不需要授权任何构建脚本。
 
-> 若未来发布 TypeScript 版本，则需要作者提供 `prepare` 脚本、你在 profile 的 `pnpm-workspace.yaml` 里
-> 写 `allowBuilds: { dsh-fleet-feishu: true }` 授权构建。
+### 2️⃣ 准备飞书应用（一次性）
 
-### 方式 B：tarball（离线/内网）
+在[飞书开放平台](https://open.feishu.cn/app) 建一个**企业自建应用**，然后：
 
-```bash
-npm pack            # 或 pnpm pack → dsh-fleet-feishu-1.9.0.tgz
-dsh plugin --profile desktop add ./dsh-fleet-feishu-1.9.0.tgz
-```
+| 要做的事 | 说明 |
+|---|---|
+| **开通权限** | 见下方「权限清单」，四个权限都要勾 |
+| **把机器人拉进群** | 在飞书里把该应用的机器人拉进你要用的群 |
+| **拿凭证** | 「凭证与基础信息」→ 复制 **App ID**（cli_ 开头）和 **App Secret** |
 
-### 方式 C：源码目录
+### 3️⃣ 填两个值
 
-```bash
-dsh plugin --profile desktop add /path/to/dsh-fleet-feishu
-```
+DSH → **插件** → 点进 **飞书飞派** → 填 **App ID**、**App Secret** → **保存**。
 
-## 配置卡片（设置 → 插件）
+> ⚠️ **保存后需要手动重启 DSH 客户端**才生效（插件不会自己重启；检测到配置变化时，它会在群里提醒你重启）。
 
-插件在 DSH 的 **设置 → 插件 → 点进本插件的详情页** 提供一张可编辑的卡片（保存即生效，无需重启）：
+搞定。插件会自动：找到机器人在哪个群 → **在群里报到** → 开始盯群消息。
+有人 **@ 机器人** 派活 → 本机执行 → **结果回到群里**。
+
+## 权限清单（建应用时勾这四个）
+
+| 权限标识 | 用途 |
+|---|---|
+| `im:chat:readonly` | 找出机器人在哪些群 |
+| `im:chat.members:read` | 在群成员里认出自己（按 app_id 匹配） |
+| `im:message:readonly` | 读群消息（接活） |
+| `im:message:send_as_bot` | 以机器人身份回帖 |
+
+## 配置项
+
+客户端配置页（**插件 → 飞书飞派**）只有两个字段：
 
 | 字段 | 说明 |
 |---|---|
-| **设备署名** | 你在群里的名字，别人 @ 它才会派活给你（如「小鲸鱿-办公室PC」） |
-| **群 ID** | 飞书群 ID（oc_ 开头）；打开群 → 群设置 → 群 ID |
-| **机器人 open_id** | 可留空：插件会拉群名册按自己的飞书应用自动匹配 |
+| **App ID** | 飞书应用 App ID（cli_ 开头） |
+| **App Secret** | 同一页面的 App Secret。只存本机，不外传 |
 
-**两种替代入口**（卡片都不能用时）：
-- 群里发一条：`@你的bot /setup` → 插件自动找群找自己并回报结果
-- 或者 `@你的bot /setup oc_xxxxxxxx 我的名字` → 手动指定
-
-## 配置
-
-安装后在 profile 的 `cordis.patch.yml`（或桌面客户端 设置 → Plugins → 该插件 → 配置）里填三项：
+其余参数在 profile 的 `cordis.patch.yml` 里改（有默认值）：
 
 ```yaml
-- insert:
-    - id: fleet-feishu
-      name: 'dsh-fleet-feishu'
-      config:
-        device_name: 小鲸鱼-办公机       # 群里署名
-        chat_id: oc_xxxxxxxxxxxx          # 群 ID
-        bot_open_id: ou_xxxxxxxxxxxx      # 本 bot 在【本应用视角】下的 open_id
+- id: fleet-feishu
+  name: 'dsh-fleet-feishu'
+  config:
+    app_id: ''
+    app_secret: ''
+    device_name: ''        # 群里署名；留空 = 自动取本机主机名
+    task_timeout_sec: 300  # 单任务超时
+    poll_interval_sec: 3   # 群消息轮询间隔（建议 ≥2）
+    task_max_depth: 3      # agent 派活深度上限
+    max_reply_chars: 3500  # 回帖长度上限
+    dsh_entry: ''          # dsh 入口；留空 = 自动探测
 ```
 
-其余项（超时、深度上限、回执窗口、名册刷新间隔、lark/dsh 入口路径等）都有默认值，
-见 [docs/USAGE.md](docs/USAGE.md) 的配置表。
+## 行为约定
 
-## 30 秒上手
-
-1. 前置：DSH 桌面客户端 + [lark-cli](https://www.npmjs.com/package/@larksuite/cli) + 一个飞书自建应用（机器人）拉进群
-2. 安装（见上）→ 填三项配置
-3. 群里发 `@你的bot /status` —— 有状态卡回执即入职成功
-
-装机不顺利？**先跑一条自测**（9 项环境检查，指出错在哪、去哪修）：
-
-```bash
-node test/smoke.mjs --chat oc_你的群ID --device 你bot的名字
-```
+- **只接 @ 自己的活**：没 @ 它 → 不理（不会抢答别人）
+- **agent 派活必须带路条**：`[任务ID|发起人|派发深度N]`；真人消息直接执行
+- **深度硬闸**：超过 `task_max_depth` 就拒绝并转人工
+- **bot 身份发言**：绝不冒名真人（agent 间消息一律 bot 身份）
+- **上下文延续**：同一会话接着聊；`dsh headless` 独立进程执行
 
 ## 工具
 
 | 工具 | 作用 |
 |---|---|
-| `fleet_send` | 向调度群发消息，可 @ 某个 bot（`mention_open_id` / `mention_name`），自动带本机署名与路条 |
-| `fleet_status` | 本机桥接状态：是否在监听、会话绑定、路条闸、名册、最近任务与日志 |
-| `fleet_roster` | 群成员名册（`action=refresh` 现拉） |
+| `fleet_status` | 桥接运行状态：bot 身份、监控的群、已处理任务数、最近错误 |
+| `fleet_send` | 往群里发消息（bot 身份），可 @ 某人 |
+| `fleet_roster` | 群成员名册（人 + 机器人 + open_id） |
+| `fleet_online` | 各设备最近发言时间（群里活跃＝在线） |
 
-群内指令（仅真人身份可用）：`/status` `/roster` `/new`（重开会话）`/resume`（续跑上次超时任务）。
+## 排错
 
-## 文档
-
-| 文档 | 回答什么问题 |
+| 现象 | 原因 |
 |---|---|
-| [docs/USAGE.md](docs/USAGE.md) | 怎么装、怎么用、出问题怎么办（FAQ 全部来自实测踩坑） |
-| [docs/PRINCIPLES.md](docs/PRINCIPLES.md) | 为什么这样设计：防循环数学、身份模型、进程模型、注回机制 |
-| [docs/DESIGN-SPEC.md](docs/DESIGN-SPEC.md) | 工程规格：模块/协议文法/配置项/测试矩阵/设计决策记录 |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | 版本史：每个坑如何变成协议的一部分 |
-| [docs/UPGRADE.md](docs/UPGRADE.md) | 从旧 python 桥迁移 + 验收四连 |
-| [docs/PUBLISHING.md](docs/PUBLISHING.md) | 发布检查清单与待决事项 |
+| 群里没有报到 | 应用没被拉进群；或权限没勾全（看 `~/.dsh/fleet-feishu/logs/bridge.log`） |
+| 报到但 @ 不响应 | 轮询没拉到消息：确认 `im:message:readonly` 已开通 |
+| 飞书接口报 `99991663` | token 失效，插件会自动重换；若持续出现说明 App ID/Secret 不对 |
+| 任务没执行 | 找不到 dsh 入口（`fleet_status` 里看「dsh 入口」），手动填 `dsh_entry` |
+| 配置改了没反应 | 需要手动重启 DSH 客户端 |
 
-## 开发与测试
-
-```bash
-pnpm install
-node test/route.test.mjs     # 33 项协议纯函数测试，无需任何依赖（clone 即可运行）
-node test/smoke.mjs --chat oc_xxx --device bot名   # 9 项环境自检
-```
-
-## Model Experience
-
-### fleet_send
-
-#### What the model sees
-
-三个工具的描述与参数 schema 会进入系统提示。`fleet_send` 的描述里写明了身份语义
-（默认 bot、需要真人身份时显式 `identity: "user"`）、路条要求（给别的设备 agent 派活必须带
-`[任务ID|发起人|派发深度N]`）与 at 标签的正确写法（用 `mention_open_id` 参数，**不要手写 `<at>` 标签**）。
-`fleet_status` 的描述说明它返回的是桥接状态快照，`fleet_roster` 说明名册与别名匹配。
-
-#### Token effect
-
-三个工具描述合计约 600 字符（约 400 token），常驻系统提示。参数 schema 为 spec 风格
-（`{ 字段: { type, required?, description? } }`），由 `@deepseek-ai/dsh-tools` 在注册时编译成 JSON Schema。
-
-#### KV Cache effect
-
-工具定义在插件加载时注册一次，之后不变 → 不产生缓存抖动。`fleet_status`/`fleet_roster` 的
-参数为空对象，保持稳定；只有 `fleet_send` 的 schema 带字段。
-
-### fleet_status
-
-#### What the model sees
-
-返回一段纯文本状态卡：是否在监听群、会话绑定、路条深度与已接任务数、待收回执、续作台账、
-名册摘要、最近事件/任务时间，以及桥接日志末 12 行。日志是排查的唯一入口，因此刻意包含在输出里。
-
-#### Token effect
-
-状态卡约 400–800 字符；日志段是最长部分（12 行）。无参数，不产生额外调用开销。
-
-#### KV Cache effect
-
-纯读取，无副作用。
-
-### fleet_roster
-
-#### What the model sees
-
-群成员列表（名称、类型、open_id、app_id、别名），以及服务端截断告警（若有）。
-`action=refresh` 会立即调飞书接口重拉。
-
-#### Token effect
-
-5 名成员约 200 字符；成员多时线性增长。
-
-#### KV Cache effect
-
-默认读本地缓存（roster.json，每 `roster_interval_min` 分钟自动刷新一次），`refresh` 才走网络。
-
-## Known Limitations and Deferred Work
-
-- **消息类型只支持 `text`**：飞书 `post` 富文本消息不触发路由（实测误触发风险大于收益，故不放开）。
-- **回执注回依赖 `sessionController` 服务**：纯 base profile（无 web/桌面端）没有该服务，
-  此时回执只在群里可见，注回会记录"注回失败"但不影响群内消息。
-- **`ou_` open_id 跨应用视角不同**：同一 bot 在不同应用视角下 id 不同，`bot_open_id` 必须填
-  **本应用视角**的那个，否则永不响应。
-- **`dsh headless` 的会话目录一致性**：`--session-id` 强制"记录目录 = 工作目录"，
-  插件实现了三级解析链与一次自愈重试，但老会话（建在旧路由时代的）仍可能 compaction 卡死。
-- **单宿主约束**：同一台机器上**只应运行一个 fleet 宿主**（桌面客户端或 `dsh --profile fleet` 二选一）。
-  两个实例会互清对方的 consume worker，造成重启风暴与重复消费。
-- **待办**：在线感知 Presence 协议（MQTT 风格）、输入框 @ 补全浮层、3 分钟装机向导
-  （见 [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) 与 `docs/DESIGN-*.md`）。
-
-## 安全
-
-安全边界与漏洞报告：见 [SECURITY.md](SECURITY.md)。功能 bug 请用 issue 模板（记得脱敏）。
+日志：`~/.dsh/fleet-feishu/logs/bridge.log`
 
 ## License
 
-MIT —— 由 宏万 与他的 AI 舰队 🐳 开发
+MIT

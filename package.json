@@ -1,8 +1,8 @@
 {
   "name": "dsh-fleet-feishu",
-  "version": "1.9.3",
+  "version": "2.0.0",
   "type": "module",
-  "description": "DSH 插件：把 DeepSeek Harness 变成飞书群里的员工——多设备 agent 协作调度、路条协议、回执注回、群名册",
+  "description": "把 DeepSeek Harness 接进飞书群：只填 App ID + App Secret，自动找群、报道、接单干活、回复到群里。不依赖 lark-cli。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -35,15 +35,18 @@
     "README.md",
     "SECURITY.md",
     "bridge.js",
+    "bridgeRest.js",
     "cordis.patch.yml",
     "docs",
+    "feishuRest.js",
     "icon.svg",
     "index.js",
     "lib/client.js",
     "locale/*.json",
     "test",
     "test/__prim_stub.cjs",
-    "test/client-load.test.cjs"
+    "test/client-load.test.cjs",
+    "test/rest.test.mjs"
   ],
   "dsh": {
     "bundle": {

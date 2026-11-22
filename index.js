@@ -1,236 +1,210 @@
-// fleet-feishu 插件入口：Agent 调度-飞书群（进程内桥接，v1.1）
-// v1.1：路条硬闸（agent→agent 必须带 [任务ID|发起人|派发深度N]，深度超限拒收、同任务回环静默丢）、
-//       群内指令 /new /reset /status /roster、配置固定 session_id、群成员名册（fleet_roster + 定时刷新）。
-// 设计约束（2026-11-21 修正）：本插件**按官方规范实现**——
-//   · 工具走 dsh-tools 的 defineTool（参数 spec→JSON Schema 自动转换 + execute 前置校验）
-//   · Config 导出 Schemastery schema（Cordis 加载时校验并填充默认值）
-//   · 与宿主共享实例的 dsh 包在 package.json 的 peerDependencies + devDependencies 同时声明
-// 之前"零内置包依赖"的变通写法已废弃（实测：插件目录解析不到 dsh-tools/schemastery，
-// 根因是未声明 peer；按官方方式声明后 pnpm 会把宿主实例链接过来）。
-// 生命周期：apply 时按配置启动桥接；配置变更触发插件重启（apply 重跑），cleanup 自动停旧桥。
-import { defineTool } from "@deepseek-ai/dsh-tools";
+// fleet-feishu —— 把本机 DSH 接进飞书群（REST 模式，不依赖 lark-cli）
+//
+// 验收标准（2026-11-22 宏万拍板，见 projects/飞书飞派插件.md）：
+//   任何人可装：插件页 → 添加插件 → 填 GitHub 地址 → 装上 → 配置页填
+//   【App ID】+【App Secret】→ 保存 → 插件自动找到机器人在哪个群 → 在群里报道
+//   → 监控群消息 → 有人 @ 它就干活 → 完成后回复到群里。
+//   插件不做重启；需要重启时提醒用户手动重启。
+//
+// 与旧版（v1.9.x，lark-cli 模式）的差别：
+//   旧版要求用户先装 lark-cli、扫码登录、再手填 chat_id / bot_open_id ——
+//   对「任何人可用」的开源插件是隐性门槛。新版全部走飞书开放平台 REST。
+//   旧实现保留在 bridge.js（lark-cli 模式），当前不再引用。
+
 import Schema from "@deepseek-ai/schemastery";
-import { createBridge, makeLogger, runtimeDir, parseTaskPass, cfgValue } from "./bridge.js";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+import os from "node:os";
+import fs from "node:fs";
+import path from "node:path";
+import { FeishuRest, cfgValue } from "./feishuRest.js";
+import { createRestBridge } from "./bridgeRest.js";
 
 export const name = "fleet-feishu";
-export const inject = ["tools", "timer", "agents"];
+export const inject = ["tools", "timer"];
 
-// 工具包装（等价 dsh-tools defineTool 的最小产出形状；参数直接用 JSON Schema，校验在 execute 内做）
-// 统一文本工具封装（走 dsh-tools 的 defineTool：参数 spec→JSON Schema、execute 前置校验）
-function textTool(name, description, parameters, execute, isConcurrencySafe) {
-  return defineTool({
-    name,
-    description,
-    parameters,                                  // spec 风格：{ 字段: { type, required?, description? } }
-    output: {
-      schema: { type: "string" },
-      render: (_args, value) => [{ type: "text", text: String(value ?? "") }],
-    },
-    async execute(args) {
-      return String(await execute(args));
-    },
-    ...(isConcurrencySafe ? { isConcurrencySafe: () => true } : {}),
-  });
-}
-
-// Config schema（Schemastery / Standard Schema）——Cordis 加载时校验并填默认值。
-// 关键三项（device_name / chat_id / bot_open_id）缺失时不阻断插件加载，只让桥保持休眠，
-// 原因见 checkConfig 的注释（这是本插件的既定行为：工具始终可见，便于排查）。
-// 注意：所有字段都用 .volatile() 声明——DSH 设置页「插件 → 插件配置」的表单
-// 只展示 volatile 字段（@deepseek-ai/dsh-settings），不加 volatile 就看不到 → 用户不会整。
-// 改动由 @deepseek-ai/dsh-config-editor 写回 profile patch 并立即生效。
 export const Config = Schema.object({
-  device_name: Schema.string().default("agent")
-    .description("★ 必填：你在群里的署名，例如「小鲸鱼-办公室PC」。群里发消息时会带上它，别人才知道是谁在干活。")
+  // ===== 客户端可编辑的两个字段（volatile 才会出现在配置表单里）=====
+  app_id: Schema.string().default("")
+    .description("飞书应用 App ID（cli_ 开头）。在飞书开放平台「凭证与基础信息」里复制。")
     .volatile(),
-  chat_id: Schema.string().default("")
-    .description("★ 必填：飞书群 ID（oc_ 开头）。打开群 → 群设置 → 群 ID 即可复制。机器人只在这个群里派活。")
+  app_secret: Schema.string().default("")
+    .description("飞书应用 App Secret。同上页面复制；只保存在本机，不会外传。")
     .volatile(),
-  bot_open_id: Schema.string().default("")
-    .description("机器人 open_id（ou_ 开头）——【可留空】：留空时插件会拉群名册、按自己的飞书应用自动匹配；若自动匹配不到（群里没这个机器人或应用不一致），可从群成员列表里找该机器人的 open_id 填这里。")
-    .volatile(),
+
+  // ===== 以下不在表单里显示，用默认值即可（改要改 profile 的 cordis.patch.yml）=====
+  device_name: Schema.string().default("")
+    .description("群里署名；留空 = 自动取本机主机名。"),
   task_timeout_sec: Schema.number().default(300)
-    .description("单个任务的执行超时（秒）。")
-    .volatile(),
-  max_reply_chars: Schema.number().default(3500)
-    .description("单条回帖的最大字符数，超出截断。")
-    .volatile(),
+    .description("单任务超时秒数。"),
+  poll_interval_sec: Schema.number().default(3)
+    .description("群消息轮询间隔秒数（建议 ≥2）。"),
   task_max_depth: Schema.number().default(3)
-    .description("路条派活的最大转手深度（安全闸），超过就拒收。")
-    .volatile(),
-  receipt_window_min: Schema.number().default(45)
-    .description("回执注回的等待窗口（分钟）。")
-    .volatile(),
-  roster_interval_min: Schema.number().default(60)
-    .description("群名册刷新间隔（分钟）；-1 关闭。")
-    .volatile(),
-  send_identity: Schema.string().default("bot")
-    .description("发消息用的身份：bot（机器人，推荐）或 user（真人身份，一般不用）。")
-    .volatile(),
-  reply_identity: Schema.string().default("bot")
-    .description("回执用的身份：bot（推荐）或 user。")
-    .volatile(),
-  reply_reject: Schema.boolean().default(true)
-    .description("收到不合规的 agent 消息时是否回一条拒绝提示。")
-    .volatile(),
-  session_id: Schema.string().default("")
-    .description("固定 dsh 会话 id；留空 = 每个任务自动开会话。")
-    .volatile(),
-  headless_profile: Schema.string().default("")
-    .description("执行任务用的 DSH profile 名；留空 = 默认 headless。")
-    .volatile(),
-  headless_env_file: Schema.string().default("")
-    .description("存放模型 key 的 .env 文件路径（留空自动找）。")
-    .volatile(),
-  headless_workspace: Schema.string().default("")
-    .description("执行任务的工作目录（会话按它分桶，改了会导致旧会话找不到）。")
-    .volatile(),
-  lark_entry: Schema.string().default("")
-    .description("lark-cli 可执行文件路径；留空 = 自动探测。")
-    .volatile(),
+    .description("agent 派活的深度上限。"),
+  max_reply_chars: Schema.number().default(3500)
+    .description("回帖正文上限字符数。"),
   dsh_entry: Schema.string().default("")
-    .description("dsh 可执行文件路径；留空 = 自动探测。")
-    .volatile(),
-  // 「像人一样协作」：问-答 + 留言板
-  hello_timeout_sec: Schema.number().default(12)
-    .description("问对方「在吗」后等多久算没回应（秒），超时转为留言。")
-    .volatile(),
-  peer_ttl_sec: Schema.number().default(300)
-    .description("多久没应答就认为对方已离线（秒）。")
-    .volatile(),
-  ask_before_dispatch: Schema.boolean().default(true)
-    .description("派活前先问一句「在吗」：答了就派，没答就留言。关掉则直接派。")
-    .volatile(),
+    .description("dsh 可执行入口绝对路径；留空 = 自动探测。"),
 });
 
-function checkConfig(config) {
-  // 官方规定：volatile 字段的运行时值是 Volatile<T> 引用，要 .get() 读。
-  // DSH 0.2.2-rc.5 起生效；直接拿 config.chat_id 做正则匹配会拿到对象 → 误报「配置未就绪」。
-  const problems = [];
-  const deviceName = cfgValue(config.device_name);
-  const chatId = cfgValue(config.chat_id);
-  const botOpenId = cfgValue(config.bot_open_id);
-  const timeout = cfgValue(config.task_timeout_sec);
-  if (!deviceName || deviceName === "未命名设备") problems.push("device_name 未设置（群里署名用）");
-  if (!/^oc_[\w-]+$/.test(chatId || "")) problems.push("chat_id 未设置或不是 oc_ 开头的群 ID");
-  // bot_open_id 留空可运行：桥会拉名册后按自己的 app_id 自动匹配（实测可靠）
-  if (botOpenId && !/^ou_[\w-]+$/.test(botOpenId)) problems.push("bot_open_id 格式不对（ou_ 开头）");
-  if (typeof timeout !== "number" || timeout <= 0) problems.push("task_timeout_sec 必须为正数");
-  return problems;
+/** 飞书 @ 提及的正文片段。 */
+function atTag(openId, name) {
+  return '<at user_id="' + openId + '">' + (name || "") + "</at>";
 }
 
 export function apply(ctx, config) {
-  // Config 不声明 schema（见头部说明）→ 手工校验；缺配置不打断插件激活，只让桥保持休眠并在工具里可见
-  const problems = checkConfig(config);
-  if (problems.length > 0) console.log("[fleet-feishu] 配置未就绪（桥保持休眠）：" + problems.join("；"));
+  const dir = (() => {
+    try {
+      const p = os.homedir() + "/.dsh/fleet-feishu";
+      return p;
+    } catch {
+      return ".dsh/fleet-feishu";
+    }
+  })();
+  const log = (m) => {
+    const line = "[fleet-feishu] " + m;
+    console.log(line);
+    try {
+      fs.mkdirSync(path.join(dir, "logs"), { recursive: true });
+      fs.appendFileSync(path.join(dir, "logs", "bridge.log"), "[" + new Date().toISOString() + "] " + m + "\n", "utf8");
+    } catch {}
+  };
 
-  // v1.2 回执注回：sessionController 在 dsh-base 里是可选服务（web 桌面端有、纯 base profile 无）
-  // 用 ctx.get 惰性取，缺失时 injectReceipt 抛错 → 桥日志记录"注回失败"，群内回执不受影响
-  const bridge = createBridge(config, makeLogger(runtimeDir()), {
-    injectReceipt: async ({ sessionId, text, requestId }) => {
-      const sc = ctx.get("sessionController");
-      if (!sc?.prompt) throw new Error("当前 profile 无 sessionController 服务（回执仅群内可见）");
-      const res = await sc.prompt({ sessionId, content: [{ type: "text", text }], requestId }, new AbortController().signal);
-      if (!res?.accepted) throw new Error("prompt 未受理：" + JSON.stringify(res));
+  const appId = String(cfgValue(config.app_id) || "").trim();
+  const appSecret = String(cfgValue(config.app_secret) || "").trim();
+  const deviceName = String(cfgValue(config.device_name) || "").trim() || os.hostname() || "agent";
+
+  if (!appId || !appSecret) {
+    log("未配置 App ID / App Secret —— 桥保持休眠。请在「插件 → 飞书飞派」的配置页填入后保存，再重启 DSH 客户端。");
+  }
+
+  const rest = new FeishuRest({ appId, appSecret, log });
+  const bridge = createRestBridge({
+    rest,
+    log,
+    options: {
+      deviceName,
+      dir,
+      dshEntry: cfgValue(config.dsh_entry),
+      taskTimeoutSec: Number(cfgValue(config.task_timeout_sec)) || 300,
+      pollIntervalMs: (Number(cfgValue(config.poll_interval_sec)) || 3) * 1000,
+      maxDepth: Number(cfgValue(config.task_max_depth)) || 3,
+      maxReplyChars: Number(cfgValue(config.max_reply_chars)) || 3500,
+      // 配置变了要提醒用户手动重启（插件自己不重启）
+      getConfig: () => ({
+        appId: String(cfgValue(config.app_id) || "").trim(),
+        appSecret: String(cfgValue(config.app_secret) || "").trim(),
+      }),
     },
   });
 
-  // 桥接生命周期挂在插件 effect 上：插件停/重载 → 自动停 consume
   ctx.effect(() => {
-    if (problems.length === 0) bridge.start();
+    if (appId && appSecret) {
+      bridge.start();
+      log("桥接已启动（设备名 " + deviceName + "）");
+    }
     return () => bridge.stop();
   });
 
-  // 名册定时刷新（roster_interval_min 分钟，0/未配=默认 60；-1 关闭）
-  const intervalMin = cfgValue(config.roster_interval_min) === undefined ? 60 : Number(cfgValue(config.roster_interval_min));
-  if (problems.length === 0 && intervalMin > 0) {
-    ctx.effect(() => ctx.timer.interval(() => { bridge.refreshRoster().catch(() => {}); }, intervalMin * 60_000));
-  }
+  // ---------- 工具 ----------
 
-  ctx.tools.register(textTool(
-    "fleet_status",
-    "查看本机「Agent 调度-飞书群」桥接的运行状态：是否在监听群消息、会话绑定、路条闸、名册、最近收到的任务与日志。",
-    {},
-    async () => bridge.statusText(),
-    () => true
-  ));
-
-  ctx.tools.register(textTool(
-    "fleet_send",
-    "向 Agent 调度群发消息，正文自动带本机 [设备名] 署名；可 @ 某个 bot 或人（mention_open_id 或 mention_name 二选一，name 走名册模糊匹配）。身份默认按配置 send_identity（默认 bot；仅在需要以真人身份发言时才显式传 user）。给其它设备 agent 派活时正文必须带路条 [任务ID|发起人|派发深度N]。从会话内调用时自动登记回执：对端在该消息线程回 [bot-reply] 会注回本会话。",
-    {
-      text: { type: "string", required: true, description: "要发送的正文（纯文本；@ 提及用 mention_open_id/mention_name 参数，不要手写 <at> 标签）" },
-      mention_open_id: { type: "string", description: "要 @ 的目标 open_id（ou_ 开头）" },
-      mention_name: { type: "string", description: "要 @ 的目标名称（从群名册模糊匹配，如「客户」「办公机」）；与 mention_open_id 同时给时以 open_id 为准" },
-      chat_id: { type: "string", description: "目标群 ID；省略则发到插件配置的群" },
-      identity: { type: "string", description: "本次发送身份：bot（默认，agent 间消息）或 user（需以真人身份发言时）" },
+  ctx.tools.register(defineTool({
+    name: "fleet_status",
+    description: "查看本机「Agent 调度-飞书群」桥接的运行状态：是否在监听群消息、bot 身份、已处理的群与任务、最近错误。",
+    parameters: {},
+    output: { schema: { type: "string" } },
+    async execute() {
+      const s = bridge.status();
+      const lines = [
+        "运行中: " + (s.running ? "是" : "否"),
+        "设备名: " + s.deviceName,
+        "App ID: " + (appId ? appId : "（未配置）"),
+        "bot open_id: " + (s.botOpenId || "（未探测到）"),
+        "监控的群: " + (s.chatIds.length ? s.chatIds.map((c) => c + " " + (s.chatNames[c] || "")).join(", ") : "（无）"),
+        "已处理任务: " + s.processed + " 条",
+        "dsh 入口: " + (s.dshEntry || "（未找到）"),
+      ];
+      if (s.lastError) lines.push("最近错误: " + s.lastError);
+      return lines.join("\n");
     },
-    async (args) => {
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "fleet_send",
+    description: "向 Agent 调度群发消息（bot 身份）。可 @ 某个 bot 或人（mention_open_id）。给其它设备 agent 派活时正文必须带路条 [任务ID|发起人|派发深度N]。",
+    parameters: {
+      text: { type: "string", required: true, description: "要发送的正文（纯文本；@ 提及用 mention_open_id 参数，不要手写标签）" },
+      mention_open_id: { type: "string", description: "要 @ 的目标 open_id（ou_ 开头）" },
+      chat_id: { type: "string", description: "目标群 ID；省略则发到插件监控的群" },
+    },
+    output: { schema: { type: "string" } },
+    async execute(args) {
       const text = String(args?.text || "").trim();
       if (!text) return "text 不能为空";
-      const initiator = typeof ctx.agents?.currentInitiator === "function" ? ctx.agents.currentInitiator() : undefined;
-      const r = await bridge.send({
-        text,
-        mentionOpenId: args.mention_open_id || null,
-        mentionName: args.mention_name || null,
-        chatId: args.chat_id || null,
-        identity: args.identity || null,
-        ownerSessionId: initiator?.id || initiator?.sessionId || null,
-      });
-      return r.content;
-    }
-  ));
+      const s = bridge.status();
+      let chatId = String(args?.chat_id || "").trim();
+      if (!chatId) {
+        if (!s.chatIds.length) return "没有可用的群（机器人还没被拉进群，或尚未探测成功）";
+        chatId = s.chatIds[0];
+      }
+      let body = "[" + deviceName + "] " + text;
+      if (args?.mention_open_id) body = atTag(args.mention_open_id) + " " + body;
+      try {
+        const id = await rest.sendToChat(chatId, body);
+        return "已发送（chat=" + chatId + "，message_id=" + id + "）";
+      } catch (e) {
+        return "发送失败：" + String(e.message || e).slice(0, 300);
+      }
+    },
+  }));
 
-  ctx.tools.register(textTool(
-    "fleet_online",
-    "查看舰队里各设备最近一次被证实在线的时间（问-答机制：对方回答「在」才算在线）。也可用 action=ping 主动问一圈谁在线。",
-    {
+  ctx.tools.register(defineTool({
+    name: "fleet_roster",
+    description: "查看「Agent 调度群」成员名册（机器人与人名 + open_id + app_id）。action=show 显示缓存，action=refresh 现拉再显示。",
+    parameters: {
+      action: { type: "string", description: "show=读缓存名册（默认），refresh=调飞书接口现拉再显示" },
+    },
+    output: { schema: { type: "string" } },
+    async execute(args) {
+      const s = bridge.status();
+      if (!s.chatIds.length) return "还没有探测到群（机器人是否已加入群？）。";
+      const chatId = s.chatIds[0];
+      let members = [];
+      try {
+        members = await rest.listMembers(chatId);
+      } catch (e) {
+        return "拉取失败：" + String(e.message || e).slice(0, 300);
+      }
+      const lines = members.map((m) =>
+        "- " + (m.name || "?") + " [" + (m.appId ? "bot" : "user") + "] " + m.memberId + (m.appId ? " app=" + m.appId : ""));
+      return "群名册 " + members.length + " 员（chat=" + chatId + "，" + (s.chatNames[chatId] || "") + "）：\n" + lines.join("\n");
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "fleet_online",
+    description: "查看各设备最近一次在群里发言的时间（群里谁活跃＝谁在线）。action=show 看记录，action=ping 主动问一圈谁在线。",
+    parameters: {
       action: { type: "string", description: "show=看已知在线状态（默认），ping=主动问一圈" },
     },
-    async (args) => {
-      const act = (args?.action || "show");
-      if (act === "ping") {
-        const rows = bridge.getRoster()?.members || [];
-        const bots = rows.filter((m) => m.type === "bot" && m.open_id !== cfgValue(config.bot_open_id));
+    output: { schema: { type: "string" } },
+    async execute(args) {
+      const s = bridge.status();
+      const peers = bridge.peerActivity();
+      if ((args?.action || "show") === "ping") {
         const out = [];
-        for (const b of bots) {
-          const ok = await bridge.askOnline(b.open_id, "ping");
-          out.push("- " + (b.name || b.open_id) + "  " + (ok ? "🟢 在" : "🔴 没应答"));
+        for (const p of peers) {
+          const ok = await bridge.askOnline(p.openId);
+          out.push("- " + (p.name || p.openId) + "  " + (ok ? "🟢 在" : "🔴 没应答"));
         }
         return out.length ? "问了一圈：\n" + out.join("\n") : "群里没有别的 bot。";
       }
-      const rows = bridge.getRoster()?.members || [];
-      const lines = rows.filter((m) => m.type === "bot").map((m) => {
-        const on = bridge.isPeerOnline(m.open_id);
-        return "- " + m.name + "  " + (on ? "🟢 在线" : "⚪ 未知（没问过或没应答）");
+      const lines = peers.map((p) => {
+        const on = bridge.isPeerOnline(p.openId);
+        return "- " + (p.name || p.openId) + "  " + (on ? "🟢 在线" : "⚪ 未知") + "  最后发言 " + (p.lastAt ? new Date(p.lastAt).toLocaleString("zh-CN") : "无");
       });
-      return "设备在线状态（问-答机制）：\n" + (lines.join("\n") || "（名册为空）")
-        + "\n提示：派活时会自动先问「在吗」，没应答就留言。";
+      return "设备在线状态（按群内发言推断）：\n" + (lines.join("\n") || "（还没看到别的 bot 发言）");
     },
-    () => true
-  ));
-
-  ctx.tools.register(textTool(
-    "fleet_roster",
-    "查看/刷新「Agent 调度群」成员名册（群里的机器人与人名 + open_id + 别名）。action=show 显示缓存，action=refresh 现拉再显示。别名可写进 ~/.dsh/fleet-feishu/roster.json 对应成员的 aliases 数组，供 mention_name 模糊匹配。",
-    {
-      action: { type: "string", description: "show=读缓存名册（默认），refresh=调飞书接口现拉再显示" },
-    },
-    async (args) => {
-      if ((args?.action || "show") === "refresh") {
-        const r = await bridge.refreshRoster();
-        if (!r.ok) return "刷新失败（详见 fleet_status 日志；常见原因：应用缺 im:chat scope 或 user 身份过期）。";
-      }
-      const ro = bridge.getRoster();
-      if (!ro) return "名册为空。用 action=refresh 拉取。";
-      const lines = (ro.members || []).map((m) =>
-        "- " + m.name + " [" + m.type + "] " + m.open_id + (m.app_id ? " app=" + m.app_id : "") + (m.aliases?.length ? " 别名:" + m.aliases.join(",") : ""));
-      const trunc = ro.truncations?.length ? "\n⚠️ 服务端截断：" + JSON.stringify(ro.truncations) : "";
-      return "群名册 " + (ro.members || []).length + " 员（" + new Date(ro.updated_at).toLocaleString("sv-SE") + "，" + ro.identity + " 身份，chat=" + ro.chat_id + "）：\n" + lines.join("\n") + trunc;
-    },
-    () => true
-  ));
+  }));
 
   return () => bridge.stop();
 }
-

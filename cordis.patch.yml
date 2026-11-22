@@ -2,25 +2,16 @@
     - id: fleet-feishu
       name: 'dsh-fleet-feishu'
       config:
-        # ===== 必填三项：按自己的机器改 =====
-        # device_name  群里署名，如「小鲸鱼-办公机」
-        # chat_id      群 ID（oc_ 开头）
-        # bot_open_id  本 bot 在【本应用视角】下的 open_id（ou_ 开头）
-        device_name: agent
-        chat_id: ''
-        bot_open_id: ''
-        # ===== 可选（有默认值，按需覆盖）=====
-        task_timeout_sec: 300
-        max_reply_chars: 3500
-        task_max_depth: 3
-        receipt_window_min: 45
-        roster_interval_min: 60
-        send_identity: bot
-        reply_identity: bot
-        reply_reject: true
-        session_id: ''
-        headless_profile: ''
-        headless_env_file: ''
-        headless_workspace: ''
-        lark_entry: ''
-        dsh_entry: ''
+        # ===== 必填两项：飞书应用凭证（开放平台 → 凭证与基础信息）=====
+        # App ID   例：cli_xxxxxxxxxxxx
+        # App Secret 同页面的 App Secret（只存在本机）
+        # 填完保存后【需要手动重启 DSH 客户端】才生效；插件自己不会重启。
+        app_id: ''
+        app_secret: ''
+        # ===== 以下默认值一般不用改（改请改 profile 的 cordis.patch.yml）=====
+        device_name: ''            # 群里署名；留空 = 自动取主机名
+        task_timeout_sec: 300      # 单任务超时秒数
+        poll_interval_sec: 3       # 群消息轮询间隔秒数
+        task_max_depth: 3          # agent 派活深度上限
+        max_reply_chars: 3500      # 回帖正文上限
+        dsh_entry: ''              # dsh 入口；留空 = 自动探测

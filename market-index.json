@@ -47,12 +47,12 @@
       },
       "versions": [
         {
-          "version": "1.9.1",
-          "publishTimestamp": 1795316976,
+          "version": "1.9.2",
+          "publishTimestamp": 1795317200,
           "source": {
             "type": "git",
             "url": "https://github.com/hongwanemail/dsh-fleet-feishu",
-            "commit": "7d93f86572f74cf71f16327c751ebc0cd3b56e07"
+            "commit": "43b14a9cf7ec68cb1b7f56db2cd70b165ee27dd0"
           },
           "engines": {
             "dsh": ">=0.2.0 <0.3.0"

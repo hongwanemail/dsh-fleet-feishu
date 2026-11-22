@@ -37,8 +37,8 @@ dsh plugin --profile desktop add github:hongwanemail/dsh-fleet-feishu
 ### 方式 B：tarball（离线/内网）
 
 ```bash
-npm pack            # 或 pnpm pack → dsh-fleet-feishu-1.4.0.tgz
-dsh plugin --profile desktop add ./dsh-fleet-feishu-1.4.0.tgz
+npm pack            # 或 pnpm pack → dsh-fleet-feishu-1.9.0.tgz
+dsh plugin --profile desktop add ./dsh-fleet-feishu-1.9.0.tgz
 ```
 
 ### 方式 C：源码目录
@@ -46,6 +46,20 @@ dsh plugin --profile desktop add ./dsh-fleet-feishu-1.4.0.tgz
 ```bash
 dsh plugin --profile desktop add /path/to/dsh-fleet-feishu
 ```
+
+## 配置卡片（设置 → 插件）
+
+插件在 DSH 的 **设置 → 插件 → 点进本插件的详情页** 提供一张可编辑的卡片（保存即生效，无需重启）：
+
+| 字段 | 说明 |
+|---|---|
+| **设备署名** | 你在群里的名字，别人 @ 它才会派活给你（如「小鲸鱿-办公室PC」） |
+| **群 ID** | 飞书群 ID（oc_ 开头）；打开群 → 群设置 → 群 ID |
+| **机器人 open_id** | 可留空：插件会拉群名册按自己的飞书应用自动匹配 |
+
+**两种替代入口**（卡片都不能用时）：
+- 群里发一条：`@你的bot /setup` → 插件自动找群找自己并回报结果
+- 或者 `@你的bot /setup oc_xxxxxxxx 我的名字` → 手动指定
 
 ## 配置
 

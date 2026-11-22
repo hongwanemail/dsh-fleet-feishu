@@ -214,13 +214,18 @@ function findInPath(bin) {
   return null;
 }
 
+/** 读取 config 值（兼容 Volatile 引用：新版 DSH 的 volatile 字段值是 Volatile<T>，需 .get()） */
+export function cfgValue(v) {
+  return (v && typeof v.get === "function") ? v.get() : v;
+}
+
 export function resolveEntry(config, kind) {
   // kind: "lark" | "dsh" —— 返回入口绝对路径，或 null（找不到则桥不启动，日志说明，不猜）
   // v1.1 修黑窗闪：lark 优先直驱 bin\lark-cli.exe 本体；run.js 启动器会 fork 出独立控制台
   // worker（黑窗一闪），只作老安装形态的回退。
   // v1.2 多平台：Windows=APPDATA npm 前缀；POSIX=HOME/npm-global、/usr/local、/opt/homebrew 常见前缀 + PATH 扫描。
-  if (kind === "lark" && config.lark_entry) return config.lark_entry;
-  if (kind === "dsh" && config.dsh_entry) return config.dsh_entry;
+  if (kind === "lark" && cfgValue(config.lark_entry)) return cfgValue(config.lark_entry);
+  if (kind === "dsh" && cfgValue(config.dsh_entry)) return cfgValue(config.dsh_entry);
   const candidates = [];
   const win = process.platform === "win32";
   const appData = process.env.APPDATA;
@@ -258,7 +263,7 @@ function readJsonSafe(path) {
 // key 注入沿用 M0/M1 的 dotenv 方案：config.headless_env_file 显式指定；
 // 留空按候选自动找（插件运行目录/.env、~/feishu-fleet/.env）。key 值永不入库（git），只记位置。
 function loadEnvFile(config, dir) {
-  const p = String(config.headless_env_file || "").trim();
+  const p = String(cfgValue(config.headless_env_file) || "").trim();
   const candidates = p ? [p] : [join(dir, ".env"), join(os.homedir(), "feishu-fleet", ".env")];
   for (const c of candidates) {
     if (!existsSync(c)) continue;
@@ -283,6 +288,18 @@ function extractJson(text) {
 }
 
 export function createBridge(config, log, hooks = {}) {
+  // ---- Volatile 兼容（官方：volatile 字段的值是 Volatile<T>，用 .get() 读）----
+  // get 时实时解包（保留"用户改完即时生效"），set 时写回原对象。
+  const cfg = new Proxy(config, {
+    get(target, prop) {
+      const v = Reflect.get(target, prop);
+      return (v && typeof v.get === "function") ? v.get() : v;
+    },
+    set(target, prop, value) {
+      try { Reflect.set(target, prop, value); } catch { /* volatile 只读 → 忽略 */ }
+      return true;
+    },
+  });
   const dir = runtimeDir();
   mkdirSync(join(dir, "inbox"), { recursive: true });
   mkdirSync(join(dir, "outbox"), { recursive: true });
@@ -342,7 +359,7 @@ export function createBridge(config, log, hooks = {}) {
     if (nodeIsElectron) env.ELECTRON_RUN_AS_NODE = "1";
     return env;
   }
-  const fixedSession = () => String(config.session_id || "").trim();
+  const fixedSession = () => String(cfg.session_id || "").trim();
 
   // ===== 零配置自举（2026-11-21）：自己找出"我在哪个群、我是谁" =====
   // 起因：GUI 装完插件不知道要填 chat_id → 群里 @ 它的 bot 零回应 → 普通人以为插件坏了。
@@ -397,11 +414,11 @@ export function createBridge(config, log, hooks = {}) {
         const mine = bots.find((b) => b.appId === myAppId);
         if (!mine) continue;
         // 找到了"我"在这个群
-        if (!config.chat_id) config.chat_id = c.id;
-        if (!config.bot_open_id) config.bot_open_id = mine.openId;
-        if (!config.device_name || config.device_name === "agent") config.device_name = mine.name;
+        if (!cfg.chat_id) cfg.chat_id = c.id;
+        if (!cfg.bot_open_id) cfg.bot_open_id = mine.openId;
+        if (!cfg.device_name || cfg.device_name === "agent") cfg.device_name = mine.name;
         bootstrapState.done = true;
-        bootstrapState.note = "已自举：群=" + (c.name || c.id) + " 设备名=" + config.device_name;
+        bootstrapState.note = "已自举：群=" + (c.name || c.id) + " 设备名=" + cfg.device_name;
         log("✅ 零配置自举成功：" + bootstrapState.note + "（chat_id=" + c.id + "）");
         return bootstrapState;
       }
@@ -445,7 +462,7 @@ export function createBridge(config, log, hooks = {}) {
   // peerOnline : open_id -> { at, name }               最近一次被证实在线的时间
   const pendingHello = new Map();
   const peerOnline = new Map();
-  const HELLO_TIMEOUT_MS = (Number(config.hello_timeout_sec) || 12) * 1000;
+  const HELLO_TIMEOUT_MS = (Number(cfg.hello_timeout_sec) || 12) * 1000;
 
   function markPeerOnline(openId, name) {
     if (!openId) return;
@@ -454,7 +471,7 @@ export function createBridge(config, log, hooks = {}) {
   function isPeerOnline(openId) {
     const rec = peerOnline.get(openId);
     if (!rec) return false;
-    return Date.now() - rec.at <= (Number(config.peer_ttl_sec) || 300) * 1000;
+    return Date.now() - rec.at <= (Number(cfg.peer_ttl_sec) || 300) * 1000;
   }
 
   /** 问对方「在吗」，等 PONG；超时返回 false */
@@ -468,7 +485,7 @@ export function createBridge(config, log, hooks = {}) {
       pendingHello.set(token, { target: targetOpenId, resolve, timer });
       const body = '<at user_id="' + targetOpenId + '"></at> [HELLO|' + token + "] 在吗？"
         + (taskText ? "（有件事：" + String(taskText).slice(0, 60) + "）" : "");
-      larkRun(["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, body);
+      larkRun(["im", "+messages-send", "--chat-id", cfg.chat_id, "--text", "-", "--as", "bot"], 30000, body);
     });
   }
 
@@ -482,7 +499,7 @@ export function createBridge(config, log, hooks = {}) {
           ...current,
           chat_id: chatId || current.chat_id,
           device_name: deviceName || current.device_name,
-          bot_open_id: current.bot_open_id || config.bot_open_id,
+          bot_open_id: current.bot_open_id || cfg.bot_open_id,
         }));
         return { ok: true, via: "configEditor" };
       }
@@ -497,7 +514,7 @@ export function createBridge(config, log, hooks = {}) {
     const out = [];
     try {
       const r = await larkRun([
-        "im", "+chat-messages-list", "--chat-id", config.chat_id,
+        "im", "+chat-messages-list", "--chat-id", cfg.chat_id,
         "--order", "desc", "--page-size", "50", "--as", "bot",
       ], 45000);
       if (!r.ok) return out;
@@ -510,8 +527,8 @@ export function createBridge(config, log, hooks = {}) {
         if (!memo) continue;
         // 必须 @ 了本 bot 才算我的留言
         const mentions = m.mentions || [];
-        if (!mentions.some((x) => x.id === config.bot_open_id)) continue;
-        const who = (m.mentions || []).find((x) => x.id === config.bot_open_id);
+        if (!mentions.some((x) => x.id === cfg.bot_open_id)) continue;
+        const who = (m.mentions || []).find((x) => x.id === cfg.bot_open_id);
         out.push({
           ...memo,
           at: m.create_time || "",
@@ -612,10 +629,10 @@ export function createBridge(config, log, hooks = {}) {
     // 所以回执改 **bot 应用身份优先**（谁的机器说谁的话），user 仅兜底；[设备名] 署名 + stdin 正文。
     let body = text;
     if (!body.startsWith("[bot-reply]")) body = "[bot-reply] " + body;
-    const dev = config.device_name || "agent";
+    const dev = cfg.device_name || "agent";
     if (!body.includes("[" + dev + "]", 0)) body = "[" + dev + "] " + body;
-    if (body.length > (config.max_reply_chars || 3500)) body = body.slice(0, config.max_reply_chars || 3500) + "\n…(已截断)";
-    const order = config.reply_identity === "user" ? ["user", "bot"] : ["bot", "user"];
+    if (body.length > (cfg.max_reply_chars || 3500)) body = body.slice(0, cfg.max_reply_chars || 3500) + "\n…(已截断)";
+    const order = cfg.reply_identity === "user" ? ["user", "bot"] : ["bot", "user"];
     for (const as of order) {
       const r = await larkRun(["im", "+messages-reply", "--message-id", messageId, "--text", "-", "--as", as], 60_000, body);
       if (r.ok) {
@@ -629,7 +646,7 @@ export function createBridge(config, log, hooks = {}) {
 
   async function refreshRoster() {
     // 名册：user 身份优先（办公机 bot 身份缺 im:chat scope，实测 99991672），bot 兜底
-    const args = ["im", "+chat-members-list", "--chat-id", config.chat_id, "--page-all", "--format", "json"];
+    const args = ["im", "+chat-members-list", "--chat-id", cfg.chat_id, "--page-all", "--format", "json"];
     let r = null, used = "user";
     for (const as of ["user", "bot"]) {
       r = await larkRun([...args, "--as", as]);
@@ -644,18 +661,18 @@ export function createBridge(config, log, hooks = {}) {
     const members = [];
     for (const b of j.data.bots || []) members.push({ open_id: b.member_id, name: b.name, type: "bot", app_id: b.app_id || "", aliases: oldAlias.get(b.member_id) || [] });
     for (const u of j.data.users || []) members.push({ open_id: u.member_id, name: u.name, type: "user", app_id: "", aliases: oldAlias.get(u.member_id) || [] });
-    st.roster = { updated_at: Date.now(), identity: used, chat_id: config.chat_id, chat_name: (old.chat_id === config.chat_id ? old.chat_name : "") || "", members, truncations: j.data.truncations || [] };
+    st.roster = { updated_at: Date.now(), identity: used, chat_id: cfg.chat_id, chat_name: (old.chat_id === cfg.chat_id ? old.chat_name : "") || "", members, truncations: j.data.truncations || [] };
     try { writeFileSync(rosterFile, JSON.stringify(st.roster, null, 2), "utf8"); } catch {}
     log("名册已更新（" + used + " 身份）：bot " + (j.data.bot_total ?? members.filter((m) => m.type === "bot").length) + " / user " + (j.data.user_total ?? members.filter((m) => m.type === "user").length));
     // 自动探测：配置里没填 bot_open_id → 用「自己的 app_id」在名册里匹配出 member_id
-    if (!config.bot_open_id && !autodetectState.done) {
+    if (!cfg.bot_open_id && !autodetectState.done) {
       autodetectState.done = true;
       const appId = await detectSelfAppId();
       autodetectState.appId = appId;
       const openId = matchSelfFromRoster(members, appId);
       if (appId && openId) {
         autodetectState.botOpenId = openId;
-        config.bot_open_id = openId;
+        cfg.bot_open_id = openId;
         log("✅ 自动探测到 bot_open_id = " + openId + "（按 app_id " + appId + " 匹配名册）");
       } else {
         log("⚠ 自动探测未命中（app_id=" + (appId || "未知") + "）—— 需在配置里手填 bot_open_id");
@@ -696,7 +713,7 @@ export function createBridge(config, log, hooks = {}) {
         writeFileSync(join(dir, "inbox", tag + ".json"), JSON.stringify({ task, pass, at: Date.now() }), "utf8");
       } catch {}
       st.lastTaskAt = Date.now();
-      await replyText(messageId, "✅ 已收到，" + (config.device_name || "agent") + " 开始处理（最长 " + (config.task_timeout_sec || 300) + "s）…");
+      await replyText(messageId, "✅ 已收到，" + (cfg.device_name || "agent") + " 开始处理（最长 " + (cfg.task_timeout_sec || 300) + "s）…");
       if (!dshEntry) {
         await replyText(messageId, "⚠️ dsh 入口未找到（请在插件配置里填 dsh_entry），任务未执行。");
         return;
@@ -704,7 +721,7 @@ export function createBridge(config, log, hooks = {}) {
       const session = fixedSession() || state.sessionId;
       // v1.3：headless_profile 仅显式指定且非默认时才传 --profile（全局位=命令路径前——实测放参数尾会 exit 1）。
       // 零配置行为与 v1.0-v1.2 已验证形态完全一致：dsh headless 自带 headless profile 物化。
-      const prof = String(config.headless_profile || "").trim();
+      const prof = String(cfg.headless_profile || "").trim();
       const baseArgs = (prof && prof !== "headless") ? [dshEntry, "--profile", prof, "headless", "--json"] : [dshEntry, "headless", "--json"];
       const envFile = loadEnvFile(config, dir);   // 每任务重读，key 轮换即生效
       const env = decorateNodeEnv({ ...process.env, ...envFile.vars });
@@ -713,7 +730,7 @@ export function createBridge(config, log, hooks = {}) {
       // v1.3 工作目录解析链：显式配置 > 绑定会话的已记录目录 > 宿主环境变量 > 家目录。
       // REG-03 实测：dsh headless 对 --session-id 强制目录一致（"recorded in X not Y" 直接拒）——
       // 老会话续接必须用其记录目录；错误文本自带该路径，runOnce 捕获后自学重试并持久化（一次自愈）。
-      const resolveWorkspace = () => String(config.headless_workspace || state.cwd || process.env.DSH_WORKSPACE || os.homedir());
+      const resolveWorkspace = () => String(cfg.headless_workspace || state.cwd || process.env.DSH_WORKSPACE || os.homedir());
 
       function runOnce(cwdUsed, isRetry) {
         const args = baseArgs.slice();
@@ -722,7 +739,7 @@ export function createBridge(config, log, hooks = {}) {
         return new Promise((finish) => {
           const child = spawn(node, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, cwd: cwdUsed, env });
           let answer = null, runErr = null, newSid = null, out = "", timedOut = false;
-          const timer = setTimeout(() => { timedOut = true; try { child.kill(); } catch {} }, (config.task_timeout_sec || 300) * 1000);
+          const timer = setTimeout(() => { timedOut = true; try { child.kill(); } catch {} }, (cfg.task_timeout_sec || 300) * 1000);
           readline.createInterface({ input: child.stdout }).on("line", (line) => {
             out += line + "\n";
             let evt; try { evt = JSON.parse(line); } catch { return; }
@@ -733,7 +750,7 @@ export function createBridge(config, log, hooks = {}) {
           child.stderr.on("data", (d) => { if (!runErr) runErr = String(d).slice(0, 300); });
           child.on("close", async (code) => {
             clearTimeout(timer);
-            if (timedOut) runErr = runErr || "任务超时（>" + (config.task_timeout_sec || 300) + "s），已终止";
+            if (timedOut) runErr = runErr || "任务超时（>" + (cfg.task_timeout_sec || 300) + "s），已终止";
             else if (code !== 0 && !runErr) runErr = "dsh headless 退出码 " + code + (out ? "" : "（无输出。若任务含 | 字符且走 cmd 会这样；本插件直调 node 不应有此问题）");
             const m = runErr ? String(runErr).match(/recorded in "([^"]+)"/) : null;
             if (m && !isRetry && m[1] !== cwdUsed) {
@@ -771,7 +788,7 @@ export function createBridge(config, log, hooks = {}) {
     const child = spawnLark(["event", "consume", "im.message.receive_v1", "--as", "bot"], { stdinHold: true }); // 坑3：stdin 保持打开
     st.child = child;
     st.running = true;
-    log("飞书事件长连接已启动（pid=" + child.pid + "，chat=" + config.chat_id + "）");
+    log("飞书事件长连接已启动（pid=" + child.pid + "，chat=" + cfg.chat_id + "）");
     readline.createInterface({ input: child.stdout }).on("line", (line) => {
       let evt; try { evt = JSON.parse(line); } catch { return; }   // [event] 等非 JSON 日志行直接跳过
       if (evt.type !== "im.message.receive_v1") return;
@@ -801,7 +818,7 @@ export function createBridge(config, log, hooks = {}) {
         const h = parseHello(evt.content);
         const body = '<at user_id="' + (evt.sender_id || "") + '"></at> [PONG|' + (h?.token || "?") + "] 在";
         st.queue = st.queue.then(() => larkRun(
-          ["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, body));
+          ["im", "+messages-send", "--chat-id", cfg.chat_id, "--text", "-", "--as", "bot"], 30000, body));
         log("收到问询 " + (h?.token || "") + " → 已答「在」");
         return;
       }
@@ -826,22 +843,22 @@ export function createBridge(config, log, hooks = {}) {
         const sp = parseSetup(evt.content);
         st.queue = st.queue.then(async () => {
           try {
-            if (sp.chatId) config.chat_id = sp.chatId;
-            if (sp.deviceName) config.device_name = sp.deviceName;
-            if (!config.chat_id || !config.bot_open_id || !config.device_name) {
+            if (sp.chatId) cfg.chat_id = sp.chatId;
+            if (sp.deviceName) cfg.device_name = sp.deviceName;
+            if (!cfg.chat_id || !cfg.bot_open_id || !cfg.device_name) {
               await bootstrap();
             }
-            const ok = !!(config.chat_id && config.bot_open_id && config.device_name);
-            const saved = ok ? await persistBinding(config.chat_id, config.device_name) : { ok: false };
+            const ok = !!(cfg.chat_id && cfg.bot_open_id && cfg.device_name);
+            const saved = ok ? await persistBinding(cfg.chat_id, cfg.device_name) : { ok: false };
             const msg = ok
-              ? "✅ 已绑定：\n  群 = " + (config.chat_id || "?") + "\n  我 = " + (config.device_name || "?") + "\n  open_id = " + (config.bot_open_id || "?")
+              ? "✅ 已绑定：\n  群 = " + (cfg.chat_id || "?") + "\n  我 = " + (cfg.device_name || "?") + "\n  open_id = " + (cfg.bot_open_id || "?")
                 + (saved.ok ? "\n  已写入配置（下次启动仍有效）" : "\n  提示：配置未持久化，下次启动会自动重新探测")
               : "⚠️ 绑定失败：还缺 " + [
-                  !config.chat_id ? "群 ID（/setup oc_xxx 名字）" : "",
-                  !config.device_name ? "署名（/setup oc_xxx 我的名字）" : "",
+                  !cfg.chat_id ? "群 ID（/setup oc_xxx 名字）" : "",
+                  !cfg.device_name ? "署名（/setup oc_xxx 我的名字）" : "",
                 ].filter(Boolean).join(" 和 ");
             await replyText(evt.message_id, msg);
-            log("/setup → " + (ok ? "成功" : "失败") + " chat=" + config.chat_id + " name=" + config.device_name);
+            log("/setup → " + (ok ? "成功" : "失败") + " chat=" + cfg.chat_id + " name=" + cfg.device_name);
           } catch (e) {
             await replyText(evt.message_id, "⚠️ /setup 出错：" + String(e).slice(0, 140));
           }
@@ -855,16 +872,16 @@ export function createBridge(config, log, hooks = {}) {
         return;
       }
       const r = routeEvent(evt, {
-        chat_id: config.chat_id, bot_open_id: config.bot_open_id,
-        max_depth: Number(config.task_max_depth) || 3,
+        chat_id: cfg.chat_id, bot_open_id: cfg.bot_open_id,
+        max_depth: Number(cfg.task_max_depth) || 3,
       }, seenTaskIds);
       if (!r.accept) {
         // 坑6：拦截回复一律走 replyText（[bot-reply] 前缀）；task-visited 静默丢，防回复风暴
-        if (evt.message_id && (r.reason === "bot-no-task-pass" || r.reason === "depth-exceeded") && config.reply_reject !== false) {
+        if (evt.message_id && (r.reason === "bot-no-task-pass" || r.reason === "depth-exceeded") && cfg.reply_reject !== false) {
           log("路条拦截（" + r.reason + "）" + String(evt.message_id).slice(0, 14));
           const why = r.reason === "bot-no-task-pass"
             ? "格式无效：agent 派活必须带路条 [任务ID|发起人|派发深度N]"
-            : "路条深度超限（" + r.pass?.depth + " > " + (Number(config.task_max_depth) || 3) + "），已拒绝，请升级给人处理";
+            : "路条深度超限（" + r.pass?.depth + " > " + (Number(cfg.task_max_depth) || 3) + "），已拒绝，请升级给人处理";
           st.queue = st.queue.then(() => replyText(evt.message_id, "⚠️ " + why));
         }
         return;
@@ -901,7 +918,7 @@ export function createBridge(config, log, hooks = {}) {
   function statusText() {
     const s = {
       running: st.running,
-      deviceName: config.device_name, chatId: config.chat_id, botOpenId: config.bot_open_id,
+      deviceName: cfg.device_name, chatId: cfg.chat_id, botOpenId: cfg.bot_open_id,
       lastEventAt: st.lastEventAt, lastTaskAt: st.lastTaskAt,
     };
     const session = fixedSession() || state.sessionId;
@@ -910,14 +927,14 @@ export function createBridge(config, log, hooks = {}) {
       "设备名: " + s.deviceName + "    bot: " + s.botOpenId,
       "lark入口: " + (larkEntry || "未找到") + "    dsh入口: " + (dshEntry || "未找到"),
       "会话: " + (session ? session + (fixedSession() ? "（配置固定）" : "（自动绑定）") : "未绑定（首任务后建立）"),
-      "路条: 深度≤" + (Number(config.task_max_depth) || 3) + "，本机已接任务 " + doneTasks.length + " 条",
+      "路条: 深度≤" + (Number(cfg.task_max_depth) || 3) + "，本机已接任务 " + doneTasks.length + " 条",
       "回执: 待收 " + liveReceipts().length + " 条" + (typeof hooks.injectReceipt === "function" ? "（注回会话可用）" : "（本 profile 无 sessionController，仅群内可见）"),
       "续作: " + (st.resume ? "有（/resume 续跑上次超时任务）" : "无"),
       "名册: " + (st.roster ? (st.roster.members || []).length + " 员（" + new Date(st.roster.updated_at).toLocaleString("sv-SE") + "，" + st.roster.identity + " 身份）" : "未拉取"),
       "最近事件: " + (s.lastEventAt ? new Date(s.lastEventAt).toLocaleString() : "无"),
       "最近任务: " + (s.lastTaskAt ? new Date(s.lastTaskAt).toLocaleString() : "无"),
       "自举: " + (bootstrapState.done ? "✅ " + bootstrapState.note : (bootstrapState.note || "未触发")),
-      "bot_open_id: " + (config.bot_open_id
+      "bot_open_id: " + (cfg.bot_open_id
         ? (autodetectState.botOpenId ? (autodetectState.botOpenId + "（自动探测）") : "（配置填写）")
         : "⚠ 未探测到"),
       "在线(问-答): " + (peerOnline.size
@@ -937,7 +954,7 @@ export function createBridge(config, log, hooks = {}) {
       return {
         running: st.running,
         larkEntry, dshEntry,
-        deviceName: config.device_name, chatId: config.chat_id, botOpenId: config.bot_open_id,
+        deviceName: cfg.device_name, chatId: cfg.chat_id, botOpenId: cfg.bot_open_id,
         lastEventAt: st.lastEventAt, lastTaskAt: st.lastTaskAt,
         sessionId: fixedSession() || state.sessionId,
         fixedSession: !!fixedSession(),
@@ -960,26 +977,26 @@ export function createBridge(config, log, hooks = {}) {
     start() {
       // 零配置自举：先自己找出"我在哪个群、我是谁"，再决定要不要手填
       st.queue = st.queue.then(async () => {
-        if (!config.chat_id || !config.bot_open_id || !config.device_name || config.device_name === "agent") {
+        if (!cfg.chat_id || !cfg.bot_open_id || !cfg.device_name || cfg.device_name === "agent") {
           await bootstrap();
         }
       });
       // 自举成功 → 主动在群里报到（用户立刻看到「装好了」）
-      if (bootstrapState.done && config.chat_id) {
-        const hello = "\u2705 我已就绪：" + (config.device_name || "agent")
-          + "\n群 = " + config.chat_id
-          + "\n用法：@" + (config.device_name || "bot") + " /status 看状态；@" + (config.device_name || "bot") + " 你的任务 派活（没应答我会留言）"
-          + "\n改绑定：@" + (config.device_name || "bot") + " /setup oc_xxx 新名字";
-        st.queue = st.queue.then(() => larkRun(["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, hello));
+      if (bootstrapState.done && cfg.chat_id) {
+        const hello = "\u2705 我已就绪：" + (cfg.device_name || "agent")
+          + "\n群 = " + cfg.chat_id
+          + "\n用法：@" + (cfg.device_name || "bot") + " /status 看状态；@" + (cfg.device_name || "bot") + " 你的任务 派活（没应答我会留言）"
+          + "\n改绑定：@" + (cfg.device_name || "bot") + " /setup oc_xxx 新名字";
+        st.queue = st.queue.then(() => larkRun(["im", "+messages-send", "--chat-id", cfg.chat_id, "--text", "-", "--as", "bot"], 30000, hello));
         log("自举成功 → 已在群里报到");
       }
-      const needCfg = config.chat_id && config.device_name;
+      const needCfg = cfg.chat_id && cfg.device_name;
       if (!needCfg) {
         log("配置不完整且自举失败 —— 桥保持休眠。请在插件配置里填 device_name 与 chat_id。");
         log("  提示：把本 bot 拉进群后重启客户端，插件会自己找到群（自举：" + bootstrapState.note + "）");
         return;
       }
-      if (!config.bot_open_id) {
+      if (!cfg.bot_open_id) {
         log("未配置 bot_open_id —— 尝试自动探测（拉名册后按自己的 app_id 匹配）");
       }
       startConsume();
@@ -992,8 +1009,8 @@ export function createBridge(config, log, hooks = {}) {
             const lines = memos.slice(0, 10).map((m) => "· [" + m.taskId + "] 来自 " + m.from + "：" + String(m.content).replace(/\s+/g, " ").slice(0, 100));
             const atPart = memos.map((m) => m.fromOpenId ? '<at user_id="' + m.fromOpenId + '"></at>' : "").join(" ");
             const body = (atPart ? atPart + " " : "")
-              + "[" + (config.device_name || "agent") + "] 我上线了，有 " + memos.length + " 条留言：\n" + lines.join("\n");
-            await larkRun(["im", "+messages-send", "--chat-id", config.chat_id, "--text", "-", "--as", "bot"], 30000, body);
+              + "[" + (cfg.device_name || "agent") + "] 我上线了，有 " + memos.length + " 条留言：\n" + lines.join("\n");
+            await larkRun(["im", "+messages-send", "--chat-id", cfg.chat_id, "--text", "-", "--as", "bot"], 30000, body);
           } else {
             log("上线检查：无留言");
           }
@@ -1003,11 +1020,11 @@ export function createBridge(config, log, hooks = {}) {
       });
     },
     async send({ text, mentionOpenId, mentionName, chatId, identity, ownerSessionId }) {
-      // fleet_send 执行体：text + <at user_id>（纯文本）。v1.2：身份=config.send_identity/本次 override
+      // fleet_send 执行体：text + <at user_id>（纯文本）。v1.2：身份=cfg.send_identity/本次 override
       // 笔记本 迁移完成前默认 user（旧桥只认 user），全舰队升齐后配置切 bot（身份归位第二步）
-      const to = chatId || config.chat_id;
-      const dev = config.device_name || "agent";
-      const as = identity || config.send_identity || "bot";
+      const to = chatId || cfg.chat_id;
+      const dev = cfg.device_name || "agent";
+      const as = identity || cfg.send_identity || "bot";
       let target = mentionOpenId || null;
       if (!target && mentionName && st.roster) {
         const q = String(mentionName).toLowerCase();
@@ -1027,10 +1044,10 @@ export function createBridge(config, log, hooks = {}) {
         st.receipts.push({
           messageId, sessionId: String(ownerSessionId),
           task: String(text).slice(0, 200), taskId: pass?.taskId || null,
-          at: Date.now(), expires: Date.now() + (Number(config.receipt_window_min) || 45) * 60_000,
+          at: Date.now(), expires: Date.now() + (Number(cfg.receipt_window_min) || 45) * 60_000,
         });
         saveReceipts();
-        log("收据登记 " + messageId.slice(0, 14) + "… → 会话 " + String(ownerSessionId).slice(0, 22) + "（窗口 " + (Number(config.receipt_window_min) || 45) + " 分钟）");
+        log("收据登记 " + messageId.slice(0, 14) + "… → 会话 " + String(ownerSessionId).slice(0, 22) + "（窗口 " + (Number(cfg.receipt_window_min) || 45) + " 分钟）");
       }
       const who = target ? "，已@" + (mentionName || target) : "";
       return { ok: true, content: "已发送（" + as + " 身份，署名 [" + dev + "]" + who + "）message_id=" + (messageId || "?") + " chat=" + to + (tracked ? "；对端回执将自动注回本会话" : "") };
